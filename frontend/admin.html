@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Election Admin</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .admin { max-width: 1100px; margin: 0 auto; }
+    .admin td, .admin th { vertical-align: top; }
+    .admin .members { font-size: 12px; color: var(--muted); text-align: left !important; }
+    .admin .code { font-size: 16px; letter-spacing: .1em; }
+    .admin .table td, .admin .table th { text-align: left; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🗳️ Election Night · Admin</div>
+    <div id="topbar-extra"><a href="/" style="color:var(--muted)">← Back to game</a></div>
+  </header>
+  <main>
+    <div class="admin">
+      <div class="card" id="login">
+        <h2>Admin login</h2>
+        <p class="muted">Enter the admin token (printed in the server log at startup, or the <code>ADMIN_TOKEN</code> env var).</p>
+        <div class="row"><input id="token" type="password" placeholder="Admin token"><button class="auto primary" id="go">Open</button></div>
+      </div>
+      <div class="card hidden" id="panel">
+        <div class="between">
+          <h2>Rooms <span class="muted" id="count"></span></h2>
+          <div class="row auto">
+            <label class="muted" style="margin:0"><input type="checkbox" id="auto" checked> auto-refresh</label>
+            <button class="small" id="refresh">Refresh</button>
+            <button class="small danger" id="purge">Delete all idle (&gt;10 min)</button>
+            <button class="small" id="logout">Log out</button>
+          </div>
+        </div>
+        <table class="table">
+          <thead><tr><th>Code</th><th>Name</th><th>Map</th><th>Status</th><th>Players</th><th>Idle</th><th></th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+  <div id="toast"></div>
+  <script type="module" src="/js/admin.js"></script>
+</body>
+</html>
