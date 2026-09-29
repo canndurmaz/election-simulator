@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from fastapi import WebSocket
 
 from . import bots
-from .engine import ActionError, Game, Player, Rules
+from .engine import DEFAULT_TRAIT, TRAITS, ActionError, Game, Player, Rules
 from .maps import load_map
 
 COLORS = ["#e63946", "#1d7fd6", "#f4a300", "#2a9d8f", "#8e44ad", "#e76f51", "#43aa8b", "#d63384"]
@@ -33,11 +33,14 @@ class Member:
     left: int = 50
     ready: bool = False
     is_bot: bool = False
+    bot_level: str = "normal"
+    trait: str = DEFAULT_TRAIT
     ws: WebSocket | None = None
 
     def public(self) -> dict:
         return {"id": self.id, "name": self.name, "party": self.party, "color": self.color, "left": self.left,
-                "ready": self.ready, "is_bot": self.is_bot, "online": self.is_bot or self.ws is not None}
+                "ready": self.ready, "is_bot": self.is_bot, "online": self.is_bot or self.ws is not None,
+                "bot_level": self.bot_level if self.is_bot else None, "trait": self.trait}
 
 
 @dataclass
@@ -72,12 +75,12 @@ class Room:
                 "host": self.members[self.host_id].name if self.host_id in self.members else None}
 
     def room_state(self) -> dict:
-        return {**self.summary(), "host_id": self.host_id, "turn_seconds": self.turn_seconds, "rounds": self.rounds,
+        return {**self.summary(), "traits": TRAITS, "bot_levels": bots.LEVELS, "host_id": self.host_id, "turn_seconds": self.turn_seconds, "rounds": self.rounds,
                 "members": [m.public() for m in self.members.values()], "chat": self.chat[-50:],
                 "deadline": self.deadline, "phase": self.phase, "acks": sorted(self.acks)}
 
     # ---------- membership ----------
-    def add_member(self, name: str, is_bot: bool = False) -> Member:
+    def add_member(self, name: str, is_bot: bool = False, level: str = "normal") -> Member:
         if self.game:
             raise RoomError("game already started")
         if len(self.members) >= self.max_players:
@@ -92,7 +95,11 @@ class Room:
             taken = {m.party for m in self.members.values()}
             party = next((p for p in BOT_PARTIES if p not in taken), f"Bot Party {len(self.members)}")
             name, left = f"Bot {len(self.members) + 1}", self.rng.choice([20, 35, 50, 65, 80])
-        m = Member(mid, secrets.token_urlsafe(16), name, party, color, left, ready=is_bot, is_bot=is_bot)
+        if is_bot and level not in bots.LEVELS:
+            raise RoomError("unknown bot level")
+        trait = self.rng.choice(list(TRAITS)) if is_bot else DEFAULT_TRAIT
+        m = Member(mid, secrets.token_urlsafe(16), name, party, color, left, ready=is_bot, is_bot=is_bot,
+                   bot_level=level, trait=trait)
         self.members[mid] = m
         if not self.host_id:
             self.host_id = mid
@@ -120,6 +127,10 @@ class Room:
             m.party = party
         if "left" in data:
             m.left = max(0, min(100, int(data["left"])))
+        if "trait" in data:
+            if data["trait"] not in TRAITS:
+                raise RoomError("unknown trait")
+            m.trait = data["trait"]
         if "color" in data:
             color = str(data["color"])
             if color not in COLORS:
@@ -139,7 +150,7 @@ class Room:
             raise RoomError("need at least 2 players (add a bot?)")
         if not all(m.ready for m in self.members.values()):
             raise RoomError("everyone must be ready")
-        players = {m.id: Player(m.id, m.name, m.party, m.color, m.left, is_bot=m.is_bot)
+        players = {m.id: Player(m.id, m.name, m.party, m.color, m.left, is_bot=m.is_bot, trait=m.trait)
                    for m in self.members.values()}
         self.game = Game(load_map(self.map_id), players, Rules(rounds=self.rounds, max_rounds=self.rounds * 2))
         self._begin_planning()
@@ -157,7 +168,7 @@ class Room:
     def _bots_submit(self) -> None:
         for m in self.members.values():
             if m.is_bot:
-                self.game.submit(m.id, bots.plan(self.game, m.id, self.rng))
+                self.game.submit(m.id, bots.plan(self.game, m.id, self.rng, m.bot_level))
 
     def ready_to_resolve(self) -> bool:
         """All connected humans submitted (disconnected players just skip their turn)."""
@@ -186,6 +197,18 @@ class Room:
         self.game.submit(mid, actions)
         if self.ready_to_resolve():
             self.resolve()
+
+    # ---------- diplomacy ----------
+    def propose_coalition(self, mid: str, target: str) -> None:
+        if not self.game or self.game.finished:
+            raise RoomError("no game running")
+        self.game.propose(mid, target)
+        t = self.members.get(target)
+        if t and t.is_bot and (mid, target) in self.game.proposals:  # bots answer right away
+            self.game.respond(target, mid, bots.respond_to_coalition(self.game, target, mid, t.bot_level, self.rng))
+            if (mid, target) not in self.game.proposals and target not in self.game.partners(mid):
+                self.chat.append({"from": t.id, "name": t.party, "color": t.color,
+                                  "text": "No thanks, we'll go it alone.", "at": time.time()})
 
     def game_state_for(self, mid: str) -> dict | None:
         if not self.game:
@@ -237,6 +260,32 @@ class RoomManager:
 
     def public_list(self) -> list[dict]:
         return [r.summary() for r in self.rooms.values() if not r.private and r.status == "lobby"]
+
+    async def close(self, code: str, reason: str = "This room was closed by an admin") -> None:
+        """Delete a room, telling any connected players why."""
+        room = self.rooms.pop(code, None)
+        if not room:
+            raise RoomError("room not found")
+        for m in room.members.values():
+            ws, m.ws = m.ws, None  # detach first so disconnect handlers don't touch the room
+            if ws is not None:
+                try:
+                    await ws.send_json({"t": "error", "msg": reason, "fatal": True})
+                    await ws.close()
+                except Exception:
+                    pass
+
+    def admin_list(self) -> list[dict]:
+        now = time.time()
+        out = []
+        for r in self.rooms.values():
+            out.append({**r.summary(), "private": r.private, "phase": r.phase if r.game else None,
+                        "round": r.game.round if r.game else None, "rounds": r.rounds,
+                        "online": sum(1 for m in r.members.values() if m.ws is not None),
+                        "idle_seconds": round(now - r.last_activity),
+                        "members": [{"name": m.name, "party": m.party, "is_bot": m.is_bot, "online": m.ws is not None}
+                                    for m in r.members.values()]})
+        return sorted(out, key=lambda r: r["idle_seconds"])
 
     def cleanup(self) -> None:
         now = time.time()

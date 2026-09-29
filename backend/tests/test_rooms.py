@@ -37,3 +37,25 @@ def test_disconnected_player_does_not_block_next_turn():
     b.ws = None
     room.maybe_next_turn()
     assert room.phase == "planning"
+
+
+def test_bot_answers_coalition_proposal_immediately():
+    room, a, b = setup_room()
+    bot = next(m for m in room.members.values() if m.is_bot)
+    bot.bot_level = "easy"
+    room.game.players[bot.id].left = room.game.players[a.id].left
+    room.propose_coalition(a.id, bot.id)
+    assert (a.id, bot.id) not in room.game.proposals  # answered, one way or the other
+
+
+def test_traits_and_bot_levels_in_room_state():
+    mgr = RoomManager()
+    room = mgr.create("t", "turkey", 4, 60, 3, False)
+    m = room.add_member("A")
+    room.set_profile(m.id, {"trait": "tycoon"})
+    bot = room.add_member("", is_bot=True, level="hard")
+    st = room.room_state()
+    assert "tycoon" in st["traits"] and st["bot_levels"] == ["easy", "normal", "hard"]
+    assert [x for x in st["members"] if x["id"] == bot.id][0]["bot_level"] == "hard"
+    with pytest.raises(RoomError):
+        room.set_profile(m.id, {"trait": "wizard"})

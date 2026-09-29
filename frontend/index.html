@@ -7,10 +7,15 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
+  <!-- three.js is vendored (frontend/vendor/three, MIT) so the 3D board works offline -->
+  <script type="importmap">
+    { "imports": { "three": "/vendor/three/three.module.min.js",
+                   "three/addons/controls/OrbitControls.js": "/vendor/three/OrbitControls.js" } }
+  </script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">🗳️ Election Night</div>
+    <div class="brand">🗳️<span class="brand-text"> Election Night</span></div>
     <div id="topbar-extra"></div>
   </header>
   <main id="app"></main>

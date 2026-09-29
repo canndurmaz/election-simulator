@@ -4,7 +4,9 @@ Round flow (all players plan simultaneously, then the round resolves):
   1. Spend: campaign actions (rallies, ads) raise support; investments buy economic stakes.
   2. Election: every region votes. Plurality winner leads it; seats are split by D'Hondt.
   3. Income: base + leadership bonus (reduced by ideology mismatch) + region economy + sector economy.
-  4. Support decays, next round. After the last round the party with the most seats wins.
+  4. Support decays, a new event card is drawn, next round.
+Game ends after the last round once every region has a winner. A coalition holding a majority wins
+together; otherwise the largest party wins.
 """
 from __future__ import annotations
 
@@ -33,7 +35,9 @@ class Rules:
     sector_pool_per_seat: float = 3_000
     sector_saturation: float = 5.0
     dominance_ratio: float = 3.0                # rule: >= 3x all others combined ...
-    dominance_share: float = 0.80               # ... takes 80% of the income
+    dominance_share: float = 0.80               # ... takes 80% of the income, permanently
+    control_min_pools: float = 1.0              # ... and hold at least 1 round's worth of that economy's income
+    permanent_region_control: bool = True       # region economies work like sectors (rule 7); False = contestable
     tv_efficiency: float = 1.2
     social_efficiency: float = 1.4
     negative_efficiency: float = 0.8
@@ -44,6 +48,38 @@ class Rules:
 
 SECTOR_MULT = {"technology": 1.3, "industry": 1.2, "trade": 1.1, "tourism": 1.0, "agriculture": 0.9}
 AD_KINDS = {"tv", "social", "negative"}
+
+# Party leader traits, picked in the lobby.
+TRAITS = {
+    "orator":     {"name": "Orator", "icon": "🎤", "text": "Rallies are 25% more effective."},
+    "media":      {"name": "Media darling", "icon": "📺", "text": "TV and social media ads are 30% more effective."},
+    "tycoon":     {"name": "Tycoon", "icon": "💼", "text": "+20% income from province/state economies and sectors."},
+    "fundraiser": {"name": "Fundraiser", "icon": "💰", "text": "Base income +60%."},
+    "populist":   {"name": "Populist", "icon": "🧲", "text": "Broad appeal: campaigns never drop below ×0.8 ideology fit, and mismatch penalties are halved."},
+    "grassroots": {"name": "Grassroots", "icon": "🌱", "text": "Your support fades only 5% per round instead of 10%."},
+}
+DEFAULT_TRAIT = "orator"
+
+
+def event_card(kind: str, **kw) -> dict:
+    """Human-readable event card; effects are applied by Game via `kind` and params."""
+    sec, reg, party = kw.get("sector"), kw.get("region_name"), kw.get("party_name")
+    cards = {
+        "opening":    ("🗞️", "Campaign season opens", "No special effects this round. Plan your opening moves!"),
+        "calm":       ("☕", "A quiet week", "Nothing unusual happens this round."),
+        "boom":       ("📈", f"{str(sec).title()} boom", f"The {sec} sector pays out 60% more this round."),
+        "crash":      ("📉", f"{str(sec).title()} slump", f"The {sec} sector pays out 50% less this round."),
+        "scandal":    ("🕵️", f"Scandal hits {party}", f"{party} loses 25% of its support everywhere before this round's vote."),
+        "debate":     ("🎙️", "TV debate night", "TV and social media ads are 50% more effective this round."),
+        "disaster":   ("🌪️", f"Disaster in {reg}", f"{reg}'s economy pays nothing this round, but rallies there are 50% more effective."),
+        "apathy":     ("😴", "Voter apathy", "Independents are 50% stronger in every region this round."),
+        "wave_left":  ("🌹", "Leftward mood swing", "Voters everywhere lean 15 points further left this round."),
+        "wave_right": ("🦅", "Rightward mood swing", "Voters everywhere lean 15 points further right this round."),
+        "donors":     ("🎁", "Donor season", "Every party receives an extra 150K in this round's income."),
+        "underdog":   ("🤲", "Sympathy for the underdog", "The party with the fewest seats receives an extra 400K this round."),
+    }
+    icon, title, text = cards[kind]
+    return {"kind": kind, "icon": icon, "title": title, "text": text, **kw}
 
 
 class ActionError(ValueError):
@@ -59,6 +95,7 @@ class Player:
     left: int  # 0..100 percent left; right = 100 - left
     money: float = 0
     is_bot: bool = False
+    trait: str = DEFAULT_TRAIT
 
     @property
     def right(self) -> float:
@@ -85,31 +122,42 @@ def dhondt(votes: dict[str, float], seats: int) -> dict[str, int]:
     return out
 
 
-def split_income(pool: float, stakes: dict[str, float], rules: Rules, saturation: float) -> dict[str, float]:
+def dominant(stakes: dict[str, float], rules: Rules, pool: float) -> str | None:
+    """The investor holding >= dominance_ratio x everyone else combined and at least
+    control_min_pools x the per-round pool (so a token investment can't claim an economy forever), or None."""
+    stakes = {k: v for k, v in stakes.items() if v > 0}
+    if not stakes:
+        return None
+    top = max(stakes, key=stakes.get)
+    others = sum(stakes.values()) - stakes[top]
+    ok = stakes[top] >= rules.dominance_ratio * others and stakes[top] >= rules.control_min_pools * pool
+    return top if ok else None
+
+
+def split_income(pool: float, stakes: dict[str, float], rules: Rules, saturation: float,
+                 owner: str | None = None) -> dict[str, float]:
     """Distribute an income pool among investors.
 
     - Payout scales up to the full pool as total investment reaches pool * saturation.
-    - If the top investor holds >= dominance_ratio x everyone else combined, they take
-      dominance_share; the rest is split among the others by stake.
-    - Otherwise it's proportional to stake.
+    - An owner (who once reached >= dominance_ratio x everyone else combined) always takes
+      dominance_share; the rest is split among the other investors by stake (all of it if there are none).
+    - Without an owner it's proportional to stake.
     """
     stakes = {k: v for k, v in stakes.items() if v > 0}
     total = sum(stakes.values())
     if total <= 0 or pool <= 0:
         return {}
     paid = pool * min(1.0, total / (pool * saturation))
-    top = max(stakes, key=stakes.get)
-    others = total - stakes[top]
-    if others <= 0:
-        return {top: paid}
-    if stakes[top] >= rules.dominance_ratio * others:
-        out = {top: paid * rules.dominance_share}
-        rest = paid * (1 - rules.dominance_share)
-        for k, v in stakes.items():
-            if k != top:
-                out[k] = rest * v / others
-        return out
-    return {k: paid * v / total for k, v in stakes.items()}
+    if owner is None:
+        return {k: paid * v / total for k, v in stakes.items()}
+    others = {k: v for k, v in stakes.items() if k != owner}
+    rest_total = sum(others.values())
+    if rest_total <= 0:
+        return {owner: paid}
+    out = {owner: paid * rules.dominance_share}
+    for k, v in others.items():
+        out[k] = paid * (1 - rules.dominance_share) * v / rest_total
+    return out
 
 
 @dataclass
@@ -127,14 +175,100 @@ class Game:
         self.support = {rid: {} for rid in self.regions}          # rid -> pid -> support
         self.region_invest = {rid: {} for rid in self.regions}    # rid -> pid -> invested
         self.sector_invest = {s: {} for s in SECTORS}             # sector -> pid -> invested
+        self.sector_owner: dict[str, str | None] = {s: None for s in SECTORS}          # permanent 80% holder
+        self.region_owner: dict[str, str | None] = {rid: None for rid in self.regions}
         self.leaders: dict[str, str | None] = {rid: None for rid in self.regions}
         self.seats: dict[str, dict[str, int]] = {rid: {} for rid in self.regions}
         self.seat_history: list[dict[str, int]] = []
         self.pending: dict[str, list[dict]] = {}
         self.reports: list[dict] = []
+        self.coalitions: list[set[str]] = []            # groups of 2+ parties
+        self.proposals: set[tuple[str, str]] = set()    # (from, to)
         self.sector_market = self._roll_market()
+        self.event = event_card("opening")
+        self.news: list[str] = []                       # diplomacy news, shown with the next round report
         for p in self.players.values():
             p.money = self.rules.start_money
+
+    # ---------- events ----------
+    def _draw_event(self) -> dict:
+        kinds = ["boom", "crash", "scandal", "debate", "disaster", "apathy", "wave_left", "wave_right",
+                 "donors", "underdog", "calm"]
+        weights = [10, 8, 9, 9, 8, 7, 6, 6, 7, 7, 6]
+        kind = self.rng.choices(kinds, weights)[0]
+        if kind in ("boom", "crash"):
+            return event_card(kind, sector=self.rng.choice(SECTORS))
+        if kind == "disaster":
+            r = self.rng.choice(list(self.regions.values()))
+            return event_card(kind, region=r["id"], region_name=r["name"])
+        if kind == "scandal":
+            totals = self.seat_totals()
+            pids = list(self.players)
+            pid = self.rng.choices(pids, [1 + totals.get(p, 0) for p in pids])[0]  # front-runners attract scrutiny
+            return event_card(kind, party=pid, party_name=self.players[pid].party)
+        return event_card(kind)
+
+    def _ev(self, kind: str) -> bool:
+        return self.event["kind"] == kind
+
+    # ---------- traits ----------
+    def _trait(self, pid: str) -> str:
+        return self.players[pid].trait
+
+    def effective_multiplier(self, pid: str, rid: str) -> float:
+        """Campaign effectiveness of pid in rid, including traits and this round's mood swing."""
+        rr = self.regions[rid]["right"]
+        if self._ev("wave_left"):
+            rr = max(0.0, rr - 0.15)
+        elif self._ev("wave_right"):
+            rr = min(1.0, rr + 0.15)
+        m = ideology_multiplier(self.players[pid].right, rr)
+        if self._trait(pid) == "populist":
+            m = max(m, 0.8)
+        return m
+
+    def independent_support(self, rid: str) -> float:
+        base = self.regions[rid]["seats"] * self.rules.independent_support_per_seat
+        return base * (1.5 if self._ev("apathy") else 1.0)
+
+    # ---------- coalitions ----------
+    def coalition_of(self, pid: str) -> set[str]:
+        return next((c for c in self.coalitions if pid in c), {pid})
+
+    def partners(self, pid: str) -> set[str]:
+        return self.coalition_of(pid) - {pid}
+
+    def propose(self, a: str, b: str) -> bool:
+        """a invites b's group to join a's. Returns True if it merged immediately (b had also invited a)."""
+        if a == b or b not in self.players or self.finished:
+            raise ActionError("bad coalition target")
+        if b in self.partners(a):
+            raise ActionError("already in a coalition together")
+        if (b, a) in self.proposals:
+            self.respond(a, b, True)
+            return True
+        self.proposals.add((a, b))
+        return False
+
+    def respond(self, b: str, a: str, accept: bool) -> None:
+        """b answers a's proposal."""
+        if (a, b) not in self.proposals:
+            raise ActionError("no such proposal")
+        self.proposals.discard((a, b))
+        if not accept:
+            return
+        self.proposals.discard((b, a))
+        merged = self.coalition_of(a) | self.coalition_of(b)
+        self.coalitions = [c for c in self.coalitions if not (c & merged)] + [merged]
+        self.news.append(f"🤝 {' + '.join(self.players[p].party for p in sorted(merged))} formed a coalition")
+
+    def leave_coalition(self, a: str) -> None:
+        group = self.coalition_of(a)
+        if len(group) < 2:
+            raise ActionError("not in a coalition")
+        rest = group - {a}
+        self.coalitions = [c for c in self.coalitions if c is not group] + ([rest] if len(rest) > 1 else [])
+        self.news.append(f"💔 {self.players[a].party} left its coalition")
 
     # ---------- planning ----------
     def _roll_market(self) -> dict[str, float]:
@@ -161,6 +295,11 @@ class Game:
                 c["region"] = self._region(a.get("region"))
             elif t == "invest_sector":
                 c["sector"] = self._sector(a.get("sector"))
+            elif t == "transfer":
+                target = a.get("target")
+                if target not in self.players or target == pid:
+                    raise ActionError("bad transfer target")
+                c["target"] = target
             elif t == "ad":
                 kind = a.get("kind")
                 if kind not in AD_KINDS:
@@ -173,6 +312,8 @@ class Game:
                     target = a.get("target")
                     if target not in self.players or target == pid:
                         raise ActionError("bad negative-ad target")
+                    if target in self.partners(pid):
+                        raise ActionError("you can't attack a coalition partner")
                     c["target"] = target
             else:
                 raise ActionError(f"unknown action {t!r}")
@@ -200,15 +341,21 @@ class Game:
 
     # ---------- resolution ----------
     def _add_support(self, rid: str, pid: str, amount: float) -> None:
-        mult = ideology_multiplier(self.players[pid].right, self.regions[rid]["right"])
         s = self.support[rid]
-        s[pid] = s.get(pid, 0) + amount * mult
+        s[pid] = s.get(pid, 0) + amount * self.effective_multiplier(pid, rid)
 
     def resolve(self) -> dict:
         if self.finished:
             raise ActionError("game is over")
         total_seats = sum(r["seats"] for r in self.regions.values())
-        events = []
+        events = [f"{self.event['icon']} {self.event['title']}"] + self.news
+        self.news = []
+        ad_boost = 1.5 if self._ev("debate") else 1.0
+        # scandal strikes before the vote
+        if self._ev("scandal"):
+            for sup in self.support.values():
+                if self.event["party"] in sup:
+                    sup[self.event["party"]] *= 0.75
         # 1. spending
         for pid, actions in self.pending.items():
             p = self.players[pid]
@@ -218,8 +365,13 @@ class Game:
                     continue  # money can't go negative even if validation was stale
                 p.money -= amt
                 t = a["type"]
+                tr = p.trait
                 if t == "rally":
-                    self._add_support(a["region"], pid, amt)
+                    boost = (1.25 if tr == "orator" else 1.0) * (1.5 if self._ev("disaster") and a["region"] == self.event["region"] else 1.0)
+                    self._add_support(a["region"], pid, amt * boost)
+                elif t == "transfer":
+                    self.players[a["target"]].money += amt
+                    events.append(f"💸 {p.party} sent money to {self.players[a['target']].party}")
                 elif t == "invest_region":
                     inv = self.region_invest[a["region"]]
                     inv[pid] = inv.get(pid, 0) + amt
@@ -227,14 +379,16 @@ class Game:
                     inv = self.sector_invest[a["sector"]]
                     inv[pid] = inv.get(pid, 0) + amt
                 elif a["kind"] == "tv":
+                    eff = self.rules.tv_efficiency * ad_boost * (1.3 if tr == "media" else 1.0)
                     for rid, r in self.regions.items():
-                        self._add_support(rid, pid, amt * self.rules.tv_efficiency * r["seats"] / total_seats)
+                        self._add_support(rid, pid, amt * eff * r["seats"] / total_seats)
                     events.append(f"{p.party} ran a national TV ad campaign")
                 elif a["kind"] == "social":
                     rs = [r for r in self.regions.values() if r["sector"] == a["sector"]]
                     seats = sum(r["seats"] for r in rs) or 1
+                    eff = self.rules.social_efficiency * ad_boost * (1.3 if tr == "media" else 1.0)
                     for r in rs:
-                        self._add_support(r["id"], pid, amt * self.rules.social_efficiency * r["seats"] / seats)
+                        self._add_support(r["id"], pid, amt * eff * r["seats"] / seats)
                     events.append(f"{p.party} targeted {a['sector']} regions with social media ads")
                 else:  # negative
                     s = self.support[a["region"]]
@@ -248,7 +402,7 @@ class Game:
         flips = []
         for rid, r in self.regions.items():
             votes = {pid: v for pid, v in self.support[rid].items() if v > 0 and pid in self.players}
-            votes[INDEPENDENT] = r["seats"] * self.rules.independent_support_per_seat
+            votes[INDEPENDENT] = self.independent_support(rid)
             self.seats[rid] = {k: v for k, v in dhondt(votes, r["seats"]).items() if v}
             ranked = sorted(votes.items(), key=lambda kv: kv[1], reverse=True)
             leader = ranked[0][0]
@@ -261,23 +415,54 @@ class Game:
         self.seat_history.append(seat_totals)
 
         # 3. income
-        income = {pid: {"base": self.rules.base_income, "leadership": 0.0, "penalty": 0.0,
-                        "regions": 0.0, "sectors": 0.0} for pid in self.players}
+        income = {pid: {"base": self.rules.base_income * (1.6 if p.trait == "fundraiser" else 1.0),
+                        "leadership": 0.0, "penalty": 0.0, "regions": 0.0, "sectors": 0.0, "event": 0.0}
+                  for pid, p in self.players.items()}
         for rid, leader in self.leaders.items():
             if leader:
                 r = self.regions[rid]
                 bonus = r["seats"] * self.rules.leader_bonus_per_seat
                 pen = bonus * mismatch_penalty(self.players[leader].right, r["right"], self.rules)
+                if self._trait(leader) == "populist":
+                    pen /= 2
                 income[leader]["leadership"] += bonus
                 income[leader]["penalty"] -= pen
+        # economic control: first to reach 3x everyone else combined owns it for the rest of the game
+        for s_ in SECTORS:
+            if self.sector_owner[s_] is None and (d := dominant(self.sector_invest[s_], self.rules, self.sector_pool(s_))):
+                self.sector_owner[s_] = d
+                events.append(f"{self.players[d].party} took permanent control of the {s_} sector")
         for rid, r in self.regions.items():
+            owner = self.region_owner[rid]
             pool = self.rules.region_pool_base + r["seats"] * self.rules.region_pool_per_seat
-            for pid, amt in split_income(pool, self.region_invest[rid], self.rules, self.rules.region_saturation).items():
+            if owner is None and (d := dominant(self.region_invest[rid], self.rules, pool)):
+                if self.rules.permanent_region_control:
+                    self.region_owner[rid] = owner = d
+                    events.append(f"{self.players[d].party} took control of {r['name']}'s economy")
+                else:
+                    owner = d
+            if self._ev("disaster") and rid == self.event["region"]:
+                continue
+            for pid, amt in split_income(pool, self.region_invest[rid], self.rules, self.rules.region_saturation,
+                                         owner).items():
                 income[pid]["regions"] += amt
-        for s in SECTORS:
-            pool = self.sector_pool(s)
-            for pid, amt in split_income(pool, self.sector_invest[s], self.rules, self.rules.sector_saturation).items():
+        for s_ in SECTORS:
+            pool = self.sector_pool(s_)
+            if self.event.get("sector") == s_:
+                pool *= 1.6 if self._ev("boom") else 0.5
+            for pid, amt in split_income(pool, self.sector_invest[s_], self.rules,
+                                         self.rules.sector_saturation, self.sector_owner[s_]).items():
                 income[pid]["sectors"] += amt
+        for pid, inc in income.items():
+            if self._trait(pid) == "tycoon":
+                inc["regions"] *= 1.2
+                inc["sectors"] *= 1.2
+        if self._ev("donors"):
+            for inc in income.values():
+                inc["event"] += 150_000
+        if self._ev("underdog"):
+            last = min(self.players, key=lambda p_: (seat_totals.get(p_, 0), self.players[p_].money))
+            income[last]["event"] += 400_000
         for pid, inc in income.items():
             for k in inc:
                 inc[k] = round(inc[k])
@@ -287,17 +472,19 @@ class Game:
         # 4. decay + advance
         for rid in self.regions:
             for pid in self.support[rid]:
-                self.support[rid][pid] *= 1 - self.rules.support_decay
+                decay = self.rules.support_decay / 2 if self._trait(pid) == "grassroots" else self.rules.support_decay
+                self.support[rid][pid] *= 1 - decay
         for rid in flips:
             events.append(f"{self.players[self.leaders[rid]].party} now leads {self.regions[rid]['name']}")
         report = {"round": self.round, "seats": seat_totals, "income": income, "events": events,
-                  "market": self.sector_market}
+                  "market": self.sector_market, "event": self.event}
         self.reports.append(report)
         if self.round >= self.rules.max_rounds or (self.round >= self.rules.rounds and not self.unclaimed()):
             self.finished = True
         else:
             self.round += 1
             self.sector_market = self._roll_market()
+            self.event = self._draw_event()
         return report
 
     # ---------- queries ----------
@@ -317,6 +504,20 @@ class Game:
                 totals[k] = totals.get(k, 0) + v
         return totals
 
+    def result(self) -> dict:
+        """Who governs: a coalition holding a majority wins together; otherwise the largest party."""
+        totals = self.seat_totals()
+        majority = sum(r["seats"] for r in self.regions.values()) // 2 + 1
+        for c in self.coalitions:
+            seats = sum(totals.get(p, 0) for p in c)
+            if seats >= majority:
+                lead = max(c, key=lambda p: (totals.get(p, 0), self.players[p].money))
+                return {"winners": sorted(c, key=lambda p: -totals.get(p, 0)), "lead": lead,
+                        "coalition": True, "seats": seats, "majority": majority}
+        lead = self.standings()[0]["id"]
+        return {"winners": [lead], "lead": lead, "coalition": False, "seats": totals.get(lead, 0),
+                "majority": majority}
+
     def standings(self) -> list[dict]:
         totals = self.seat_totals()
         cumulative = {pid: sum(h.get(pid, 0) for h in self.seat_history) for pid in self.players}
@@ -334,20 +535,26 @@ class Game:
             "finished": self.finished, "overtime": self.round > self.rules.rounds, "unclaimed": self.unclaimed(),
             "market": self.sector_market,
             "regions": {rid: {"support": rnd(self.support[rid]), "invest": rnd(self.region_invest[rid]),
-                              "leader": self.leaders[rid], "seats": self.seats[rid],
+                              "leader": self.leaders[rid], "seats": self.seats[rid], "owner": self.region_owner[rid],
                               "independent": r["seats"] * self.rules.independent_support_per_seat,
                               "pool": self.rules.region_pool_base + r["seats"] * self.rules.region_pool_per_seat}
                         for rid, r in self.regions.items()},
             "sectors": {s: rnd(self.sector_invest[s]) for s in SECTORS},
+            "sector_owner": self.sector_owner,
             "sector_pools": {s: round(self.sector_pool(s)) for s in SECTORS},
             "saturation": {"region": self.rules.region_saturation, "sector": self.rules.sector_saturation},
             "standings": self.standings(),
             "submitted": sorted(self.pending),
             "last_report": self.reports[-1] if self.reports else None,
             "seat_history": self.seat_history,
-            "winner": self.standings()[0]["id"] if self.finished else None,
+            "winner": self.result()["lead"] if self.finished else None,
+            "result": self.result() if self.finished else None,
+            "event": self.event,
+            "coalitions": [sorted(c) for c in self.coalitions],
+            "proposals": sorted(self.proposals),
+            "traits": {pid: p.trait for pid, p in self.players.items()},
             "rules": {k: getattr(self.rules, k) for k in (
                 "min_action", "dominance_ratio", "dominance_share", "leader_bonus_per_seat", "mismatch_grace",
                 "mismatch_penalty_slope", "mismatch_penalty_cap", "tv_efficiency", "social_efficiency",
-                "negative_efficiency", "support_decay")},
+                "negative_efficiency", "support_decay", "control_min_pools")},
         }

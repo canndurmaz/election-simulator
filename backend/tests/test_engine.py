@@ -3,7 +3,7 @@ import random
 import pytest
 
 from app import bots
-from app.engine import (INDEPENDENT, ActionError, Game, Player, Rules, dhondt, ideology_multiplier,
+from app.engine import (INDEPENDENT, ActionError, Game, Player, Rules, dhondt, dominant, ideology_multiplier,
                         mismatch_penalty, split_income)
 from app.maps import load_map
 
@@ -22,20 +22,43 @@ def test_turkey_map_has_600_seats_81_provinces():
     assert {r["sector"] for r in m["regions"]} == {"agriculture", "industry", "trade", "tourism", "technology"}
 
 
-def test_dominance_takes_80_percent():
-    out = split_income(100, {"a": 300, "b": 60, "c": 40}, R, saturation=1)
+def test_owner_takes_80_percent():
+    out = split_income(100, {"a": 300, "b": 60, "c": 40}, R, saturation=1, owner="a")
     assert out["a"] == pytest.approx(80)
     assert out["b"] == pytest.approx(12)
     assert out["c"] == pytest.approx(8)
 
 
-def test_below_dominance_is_proportional():
+def test_no_owner_is_proportional():
     out = split_income(100, {"a": 290, "b": 100}, R, saturation=1)
     assert out["a"] == pytest.approx(100 * 290 / 390)
 
 
 def test_sole_investor_gets_all_but_scaled_by_saturation():
-    assert split_income(100, {"a": 200}, R, saturation=4) == {"a": pytest.approx(50)}
+    assert split_income(100, {"a": 200}, R, saturation=4, owner="a") == {"a": pytest.approx(50)}
+
+
+def test_dominant_needs_3x_and_a_minimum_stake():
+    assert dominant({"a": 300, "b": 100}, R, pool=100) == "a"
+    assert dominant({"a": 290, "b": 100}, R, pool=100) is None
+    assert dominant({"a": 50}, R, pool=100) is None          # token investment can't claim it
+    assert dominant({"a": 100}, R, pool=100) == "a"
+
+
+def test_sector_control_is_permanent():
+    g = game()
+    pool = g.sector_pool("industry")
+    g.submit("a", [{"type": "invest_sector", "sector": "industry", "amount": int(pool) + 10_000}]); g.submit("b", [])
+    rep = g.resolve()
+    assert g.sector_owner["industry"] == "a"
+    assert any("permanent control of the industry" in e for e in rep["events"])
+    # b now outspends a massively -- a still keeps 80%
+    g.players["b"].money = 10**9
+    g.submit("a", []); g.submit("b", [{"type": "invest_sector", "sector": "industry", "amount": 50_000_000}])
+    g.resolve()
+    assert g.sector_owner["industry"] == "a"
+    share = split_income(g.sector_pool("industry"), g.sector_invest["industry"], g.rules, g.rules.sector_saturation, "a")
+    assert share["a"] == pytest.approx(0.8 * sum(share.values()))
 
 
 def test_dhondt():
@@ -116,3 +139,10 @@ def test_overtime_capped():
         g.submit("a", []); g.submit("b", [])
         g.resolve()
     assert len(g.seat_history) == 4 and len(g.unclaimed()) == 81
+
+
+@pytest.mark.parametrize("map_id,regions,seats", [("turkey", 81, 600), ("usa", 51, 538), ("germany", 16, 630)])
+def test_all_maps_load(map_id, regions, seats):
+    m = load_map(map_id)
+    assert len(m["regions"]) == regions and sum(r["seats"] for r in m["regions"]) == seats
+    assert len({r["id"] for r in m["regions"]}) == regions

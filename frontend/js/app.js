@@ -15,8 +15,18 @@ const S = {
   session: null,   // {code, token, player_id}
   ws: null, room: null, game: null, you: null,
   map: null, mapView: null, mapMode: 'leader', selected: null,
-  tab: 'region', plan: [], planRound: null, lastRound: null,
+  tab: 'region', plan: [], planRound: null, targets: [],
+  view: localStorage.getItem('view') || '2d', board: null, boardLoading: false,
 };
+
+// ---------- layout ----------
+const mobileMq = matchMedia('(max-width: 820px)');
+const isMobile = () => mobileMq.matches;
+mobileMq.addEventListener('change', () => {
+  if (!isMobile() && S.tab === 'map') S.tab = 'region';
+  if (S.room) render();
+});
+const TAB_ICON = { map: '🗺️', region: '📍', campaign: '📣', economy: '🏭', plan: '📝', diplomacy: '🤝', standings: '🏆', report: '📰', chat: '💬' };
 
 // ---------- utils ----------
 function toast(msg, info = false) {
@@ -32,7 +42,8 @@ async function api(path, body) {
 }
 function money(n) {
   const c = S.map?.currency || '$', sign = n < 0 ? '−' : '', a = Math.abs(n);
-  const fmt = (v, suf) => `${sign}${c}${(v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)).replace(/\.?0+$/, '')}${suf}`;
+  const trim = t => t.includes('.') ? t.replace(/0+$/, '').replace(/\.$/, '') : t;  // 1.50 -> 1.5, 100 stays 100
+  const fmt = (v, suf) => `${sign}${c}${trim(v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2))}${suf}`;
   if (a >= 1e6) return fmt(a / 1e6, 'M');
   if (a >= 1e3) return fmt(a / 1e3, 'K');
   return `${sign}${c}${Math.round(a)}`;
@@ -50,6 +61,18 @@ function mix(a, b, t) {
   return '#' + x.map((v, i) => Math.round(v + (y[i] - v) * t).toString(16).padStart(2, '0')).join('');
 }
 const ideoMult = (pr, rr) => 0.4 + 0.8 * (1 - Math.abs(pr - rr));
+// Same as the server's effective_multiplier: ideology fit, adjusted by mood-swing events and the Populist trait.
+function effMult(pid, r) {
+  let rr = r.right;
+  const ev = S.game?.event?.kind;
+  if (ev === 'wave_left') rr = Math.max(0, rr - 0.15);
+  if (ev === 'wave_right') rr = Math.min(1, rr + 0.15);
+  const m = ideoMult((100 - (player(pid)?.left ?? 50)) / 100, rr);
+  return S.game?.traits?.[pid] === 'populist' ? Math.max(m, 0.8) : m;
+}
+const traitOf = id => S.room?.traits?.[S.game?.traits?.[id] ?? player(id)?.trait];
+const traitIcon = id => traitOf(id) ? `<span title="${esc(traitOf(id).name)}: ${esc(traitOf(id).text)}">${traitOf(id).icon}</span>` : '';
+const partnersOf = id => (S.game?.coalitions.find(c => c.includes(id)) || [id]).filter(x => x !== id);
 function mismatch(pr, rr) {
   const R = S.game.rules;
   return Math.min(R.mismatch_penalty_cap, Math.max(0, Math.abs(pr - rr) - R.mismatch_grace) * R.mismatch_penalty_slope);
@@ -65,20 +88,51 @@ function bars(entries, total, fmt = v => v.toFixed(0)) {
     <div class="track"><div class="fill" style="width:${total ? 100 * v / total : 0}%;background:${partyColor(id)}"></div></div>
     <span style="text-align:right">${fmt(v)}</span></div>`).join('')}</div>`;
 }
-function dominance(stakes) {
-  const e = Object.entries(stakes); if (!e.length) return null;
-  e.sort((a, b) => b[1] - a[1]);
-  const others = e.slice(1).reduce((s, [, v]) => s + v, 0);
-  if (!others) return { id: e[0][0], solo: true };
-  if (e[0][1] >= S.game.rules.dominance_ratio * others) return { id: e[0][0] };
-  return { need: S.game.rules.dominance_ratio * others - e[0][1], id: e[0][0], contested: true };
+// Economic control of a sector / region economy: an owner keeps 80% for the rest of the game.
+// Otherwise report who is closest and how much more they must invest to take it.
+// Stake ratio of `id`: their investment ÷ everyone else's combined (Infinity when nobody else invested).
+function stakeRatio(stakes, id) {
+  const mine = stakes[id] || 0, others = Object.entries(stakes).reduce((t, [k, v]) => t + (k === id ? 0 : v), 0);
+  return others ? mine / others : (mine ? Infinity : 0);
+}
+const fmtRatio = r => r === Infinity ? 'only investor' : `${r >= 10 ? r.toFixed(0) : r.toFixed(1)}×`;
+
+// Economic control of a sector / region economy: an owner keeps 80% for the rest of the game.
+// Otherwise report who is closest, their current ratio, and how much more they must invest to take it.
+function control(stakes, owner, pool) {
+  const R = S.game.rules, e = Object.entries(stakes).sort((a, b) => b[1] - a[1]);
+  const mine = stakes[S.you] ? stakeRatio(stakes, S.you) : null;
+  if (owner) return { owner, ratio: stakeRatio(stakes, owner), mine };
+  const floor = R.control_min_pools * pool;
+  if (!e.length) return { need: floor, ratio: 0, mine };
+  const others = e.slice(1).reduce((t, [, v]) => t + v, 0);
+  return { id: e[0][0], ratio: stakeRatio(stakes, e[0][0]), mine, need: Math.max(R.dominance_ratio * others, floor) - e[0][1] };
+}
+function ratioBar(c) {
+  const R = S.game.rules, target = R.dominance_ratio;
+  const lead = c.owner || c.id;
+  const fill = c.ratio === Infinity ? 100 : Math.min(100, 100 * c.ratio / target);
+  return `<div class="ratio">
+    <div class="between"><span>Current ratio${lead ? ` · <b style="color:${partyColor(lead)}">${esc(partyName(lead))}</b>` : ''}</span>
+      <b>${lead ? fmtRatio(c.ratio) : '—'} <span class="muted">/ ${target}× needed</span></b></div>
+    <div class="ratio-bar"><div style="width:${fill}%;background:${lead ? partyColor(lead) : 'transparent'}"></div></div>
+    ${c.mine !== null && lead !== S.you ? `<div class="muted" style="font-size:12px">Your ratio: <b>${fmtRatio(c.mine)}</b></div>` : ''}
+  </div>`;
+}
+function controlNote(c) {
+  const R = S.game.rules;
+  if (c.owner) return `${ratioBar(c)}<div class="own-note">🔒 <b style="color:${partyColor(c.owner)}">${esc(partyName(c.owner))}</b> owns this — ${pct(R.dominance_share)} of the income for the rest of the game${c.owner === S.you ? ' (you!)' : '. Others share the remaining ' + pct(1 - R.dominance_share) + '.'}</div>`;
+  const who = c.id ? `${esc(partyName(c.id))} needs` : 'Anyone needs';
+  return `${ratioBar(c)}<div class="muted" style="font-size:12px;margin-top:4px">${who} ${money(c.need)} more to take <b>permanent</b> control (≥${R.dominance_ratio}× everyone else combined${c.id && c.ratio >= R.dominance_ratio ? ' and at least one round of its income' : ''}).</div>`;
 }
 
 // ---------- session / routing ----------
 function saveSession(s) { S.session = s; localStorage.setItem('session:' + s.code, JSON.stringify(s)); history.replaceState(null, '', '?room=' + s.code); }
 function forgetSession() {
   if (S.session) localStorage.removeItem('session:' + S.session.code);
-  S.session = null; S.room = S.game = null; S.mapView = null;
+  S.session = null; S.room = S.game = null; S.mapView = null; S.dismissedFinal = false;
+  disposeBoard();
+  ['results-ov', 'final-ov'].forEach(id => document.getElementById(id)?.remove());
   if (S.ws) { S.ws.onclose = null; S.ws.close(); S.ws = null; }
   history.replaceState(null, '', '/');
   renderHome();
@@ -111,7 +165,8 @@ function render() {
 
 // ---------- home ----------
 async function renderHome() {
-  $('#topbar-extra').innerHTML = '';
+  $('#topbar-extra').innerHTML = `<button class="small" id="howto">❓ How to play</button>`;
+  $('#howto').onclick = () => showTutorial(0);
   S.mapView = null;
   const maps = await api('/api/maps').catch(() => []);
   const params = new URLSearchParams(location.search);
@@ -181,7 +236,8 @@ function renderLobby() {
   const r = S.room, mine = me(), host = r.host_id === S.you;
   if (!mine) return;
   const focused = document.activeElement?.id;
-  $('#topbar-extra').innerHTML = `<button class="small danger" id="leave">Leave room</button>`;
+  $('#topbar-extra').innerHTML = `<button class="small" id="howto">❓ How to play</button><button class="small danger" id="leave">Leave room</button>`;
+  $('#howto').onclick = () => showTutorial(0);
   $('#leave').onclick = () => { send({ t: 'leave' }); forgetSession(); };
   const taken = new Set(r.members.filter(m => m.id !== S.you).map(m => m.color));
   const partyDraft = $('#party')?.value;
@@ -194,13 +250,13 @@ function renderLobby() {
       <h3>Parties (${r.members.length}/${r.max_players})</h3>
       ${r.members.map(m => `
         <div class="member"><span class="dot" style="background:${m.color}"></span>
-          <div><b>${esc(m.party)}</b> <span class="muted">— ${esc(m.name)}</span> ${m.id === r.host_id ? '<span class="badge">host</span>' : ''} ${m.is_bot ? '<span class="badge">bot</span>' : ''} ${!m.online ? '<span class="badge">offline</span>' : ''}
+          <div><b>${esc(m.party)}</b> <span class="muted">— ${esc(m.name)}</span> ${m.id === r.host_id ? '<span class="badge">host</span>' : ''} ${m.is_bot ? `<span class="badge">${esc(m.bot_level)} bot</span>` : ''} <span class="badge" title="${esc(r.traits[m.trait]?.text)}">${r.traits[m.trait]?.icon} ${esc(r.traits[m.trait]?.name)}</span> ${!m.online ? '<span class="badge">offline</span>' : ''}
             ${ideoBar(m.left)}</div>
           <div class="row auto">${m.ready ? '<span class="badge ok">ready</span>' : '<span class="badge">not ready</span>'}
             ${host && m.id !== S.you ? `<button class="small danger" data-kick="${m.id}">✕</button>` : ''}</div>
         </div>`).join('')}
       ${host ? `<div class="row" style="margin-top:12px">
-        <button id="addbot" ${r.members.length >= r.max_players ? 'disabled' : ''}>+ Add bot</button>
+        ${r.bot_levels.map(l => `<button class="small" data-addbot="${l}" ${r.members.length >= r.max_players ? 'disabled' : ''}>+ ${l[0].toUpperCase() + l.slice(1)} bot</button>`).join('')}
         <button class="primary" id="start" ${r.members.length < 2 || !r.members.every(m => m.ready) ? 'disabled' : ''}>Start election</button></div>`
       : '<p class="muted">Waiting for the host to start…</p>'}
     </div>
@@ -214,7 +270,9 @@ function renderLobby() {
         <label>Ideology — <span id="ideolabel">${mine.left}% left / ${100 - mine.left}% right</span></label>
         <input type="range" id="left" min="0" max="100" step="5" value="${mine.left}" style="direction:rtl">
         <div class="between muted" style="font-size:12px"><span>◀ Right</span><span>Left ▶</span></div>
-        <p class="muted" style="font-size:12px">Campaigns work best in provinces that match your ideology. Winning a province that doesn't match costs you part of its leadership income.</p>
+        <p class="muted" style="font-size:12px">Campaigns work best where voters match your ideology. Winning a region that doesn't match costs you part of its leadership income.</p>
+        <label>Party leader's strength</label>
+        <div class="traits">${Object.entries(r.traits).map(([k, t]) => `<button class="trait ${k === mine.trait ? 'sel' : ''}" data-trait="${k}"><b>${t.icon} ${esc(t.name)}</b><span>${esc(t.text)}</span></button>`).join('')}</div>
         <button class="${mine.ready ? '' : 'primary'}" id="ready" style="width:100%">${mine.ready ? 'Not ready' : "I'm ready"}</button>
       </div>
       <div class="card chat" style="margin-top:14px">${chatHtml()}</div>
@@ -224,12 +282,13 @@ function renderLobby() {
   $('#saveparty').onclick = () => send({ t: 'profile', party: $('#party').value });
   $('#party').onkeydown = e => e.key === 'Enter' && send({ t: 'profile', party: $('#party').value });
   document.querySelectorAll('[data-color]').forEach(b => b.onclick = () => send({ t: 'profile', color: b.dataset.color }));
+  document.querySelectorAll('[data-trait]').forEach(b => b.onclick = () => send({ t: 'profile', trait: b.dataset.trait }));
   $('#left').oninput = e => { const l = +e.target.value; $('#ideolabel').textContent = `${l}% left / ${100 - l}% right`; };
   $('#left').onchange = e => send({ t: 'profile', left: +e.target.value });
   $('#ready').onclick = () => send({ t: 'ready', ready: !mine.ready });
   document.querySelectorAll('[data-kick]').forEach(b => b.onclick = () => send({ t: 'kick', id: b.dataset.kick }));
   if (host) {
-    $('#addbot').onclick = () => send({ t: 'add_bot' });
+    document.querySelectorAll('[data-addbot]').forEach(b => b.onclick = () => send({ t: 'add_bot', level: b.dataset.addbot }));
     $('#start').onclick = () => send({ t: 'start' });
   }
   bindChat();
@@ -248,22 +307,54 @@ function bindChat() {
 }
 
 // ---------- game ----------
+const RL = () => S.map?.region_label || 'Region';                 // "Province" / "State"
+const rls = () => RL().toLowerCase() + 's';
 const planTotal = () => S.plan.reduce((s, a) => s + a.amount, 0);
 const budget = () => (S.game.standings.find(s => s.id === S.you)?.money ?? 0) - planTotal();
+const canEdit = () => S.room.phase === 'planning' && !S.game.my_pending && !S.game.finished;
+const actionKey = a => [a.type, a.kind, a.region, a.sector, a.target].filter(Boolean).join('|');
+const planned = a => S.plan.find(p => actionKey(p) === actionKey(a));
+const CHIPS = [10e3, 25e3, 50e3, 100e3, 250e3, 500e3, 1e6, 2.5e6, 5e6];
 
-function addAction(a) {
-  if (S.game.my_pending) return toast('Already submitted — click "Edit plan" to change it');
-  if (!Number.isFinite(a.amount) || a.amount < S.game.rules.min_action) return toast(`Minimum is ${money(S.game.rules.min_action)}`);
-  if (a.amount > budget()) return toast('Not enough funds');
-  S.plan.push(a);
+// Add (delta > 0), remove (delta < 0), 'max' (all remaining funds) or 'clear' money on one action.
+function spend(a, delta) {
+  if (!canEdit()) return toast(S.game.my_pending ? 'Plan submitted — click "Edit plan" to change it' : 'Wait for the next turn');
+  const min = S.game.rules.min_action, cur = planned(a);
+  if (delta === 'clear') { if (cur) S.plan.splice(S.plan.indexOf(cur), 1); return renderGame(); }
+  let amt = delta === 'max' ? Math.floor(budget() / 1000) * 1000 : delta;
+  if (amt > 0) amt = Math.min(amt, Math.floor(budget() / 1000) * 1000);
+  if (delta !== 'max' && delta > 0 && amt <= 0) return toast('No funds left to plan');
+  if (cur) {
+    cur.amount += amt;
+    if (cur.amount < min) S.plan.splice(S.plan.indexOf(cur), 1);
+  } else {
+    if (amt < min) return toast(`Not enough funds (minimum ${money(min)})`);
+    S.plan.push({ ...a, amount: amt });
+  }
   renderGame();
 }
+
+function spender(a) {
+  const i = S.targets.push(a) - 1;
+  const cur = planned(a)?.amount || 0, b = budget();
+  const chips = CHIPS.filter(c => c <= b).slice(-4);
+  const step = chips[0] || CHIPS[0];
+  const dis = canEdit() ? '' : 'disabled';
+  return `<div class="spender">
+    <div class="between"><span>${cur ? `Planned: <b class="good">${money(cur)}</b>` : '<span class="muted">Nothing planned</span>'}</span>
+      ${cur ? `<span class="row auto"><button class="small" data-spend="${i}" data-delta="${-step}" ${dis}>−${money(step)}</button><button class="small danger" data-spend="${i}" data-delta="clear" ${dis}>✕</button></span>` : ''}</div>
+    <div class="chips">${chips.map(c => `<button class="chip" data-spend="${i}" data-delta="${c}" ${dis}>+${money(c)}</button>`).join('')}
+      <button class="chip max" data-spend="${i}" data-delta="max" ${dis || (b < S.game.rules.min_action ? 'disabled' : '')}>All left</button></div>
+  </div>`;
+}
+
 function describe(a) {
   const rn = id => esc(region(id)?.name);
   switch (a.type) {
     case 'rally': return `📣 Rally in ${rn(a.region)}`;
     case 'invest_region': return `🏗️ Invest in ${rn(a.region)}`;
     case 'invest_sector': return `${SECTOR_ICON[a.sector]} Invest in ${a.sector}`;
+    case 'transfer': return `💸 Send money to ${esc(partyName(a.target))}`;
     case 'ad': return a.kind === 'tv' ? '📺 National TV ad' : a.kind === 'social' ? `📱 Social ads → ${a.sector}` : `🗯️ Attack ad vs ${esc(partyName(a.target))} in ${rn(a.region)}`;
   }
 }
@@ -273,7 +364,7 @@ function colorOf(id) {
   if (S.mapMode === 'sector') return SECTOR_COLOR[r.sector];
   if (S.mapMode === 'ideology') return mix('#e05263', '#3d8bd4', r.right);
   if (S.mapMode === 'invest') {
-    const d = dominance(g.invest); return d ? (d.contested ? '#666' : partyColor(d.id)) : '#2a3244';
+    return g.owner ? partyColor(g.owner) : Object.keys(g.invest).length ? '#555c6b' : '#2a3244';
   }
   if (S.mapMode === 'match') return mix('#5a1f28', '#2d8f5c', 1 - Math.abs(myRight() - r.right));
   if (g.leader) {
@@ -286,7 +377,7 @@ function colorOf(id) {
 
 function tooltip(e, id) {
   const tt = $('#tooltip');
-  if (!e) return tt.classList.add('hidden');
+  if (!e || (e.pointerType && e.pointerType !== 'mouse')) return tt.classList.add('hidden');  // hover info is mouse-only
   const r = region(id), g = S.game.regions[id];
   tt.innerHTML = `<b>${esc(r.name)}</b> · ${r.seats} ${esc(S.map.seat_label)}<br>
     <span class="tag" style="background:${SECTOR_COLOR[r.sector]}">${r.sector}</span> ${pct(1 - r.right)} left / ${pct(r.right)} right<br>
@@ -302,25 +393,43 @@ function renderTopbar() {
   const g = S.game, st = g.standings.find(s => s.id === S.you);
   $('#topbar-extra').innerHTML = `
     <div class="stat"><b class="${g.overtime && !g.finished ? 'bad' : ''}">${g.finished ? 'Final' : `Round ${g.round}/${g.rounds}`}</b><span>${g.finished ? 'results' : g.overtime ? 'overtime' : 'round'}</span></div>
-    <div class="stat"><b>${g.unclaimed.length}</b><span>provinces without a winner</span></div>
+    <div class="stat opt"><b>${g.unclaimed.length}</b><span>${rls()} without a winner</span></div>
     <div class="stat"><b id="timer">–</b><span>time left</span></div>
-    <div class="stat"><b>${st?.seats ?? 0}</b><span>your seats</span></div>
+    <div class="stat opt"><b>${st?.seats ?? 0}</b><span>your ${esc(S.map.seat_label)}</span></div>
     <div class="stat"><b>${money(st?.money ?? 0)}</b><span>funds</span></div>
     <div class="stat"><b class="${budget() < 0 ? 'bad' : 'good'}">${money(budget())}</b><span>left to plan</span></div>
-    <button class="small danger" id="leave">Leave</button>`;
+    <button class="small" id="howto" title="How to play">❓<span class="lbl"> How to play</span></button>
+    <button class="small danger" id="leave" title="Leave">⎋<span class="lbl"> Leave</span></button>`;
+  $('#howto').onclick = () => showTutorial(0);
   $('#leave').onclick = () => { if (confirm('Leave the game? Your party stays and you can rejoin with the same browser.')) { send({ t: 'leave' }); forgetSession(); } };
   clearInterval(timerInterval);
-  const tick = () => { const t = $('#timer'); if (!t) return; const s = S.game.deadline ? Math.max(0, Math.round(S.game.deadline - Date.now() / 1000)) : null; t.textContent = s == null ? '–' : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; t.className = s != null && s < 15 ? 'bad' : ''; };
+  const tick = () => { const t = $('#timer'); if (!t) return; const s = S.room.deadline ? Math.max(0, Math.round(S.room.deadline - Date.now() / 1000)) : null; t.textContent = s == null ? '–' : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; t.className = s != null && s < 15 ? 'bad' : ''; };
   tick(); timerInterval = setInterval(tick, 1000);
+}
+
+function seatDelta(id) {
+  const h = S.game.seat_history;
+  if (h.length < 1) return 0;
+  return (h[h.length - 1][id] || 0) - (h.length > 1 ? (h[h.length - 2][id] || 0) : 0);
+}
+const deltaHtml = d => d > 0 ? `<span class="good">▲${d}</span>` : d < 0 ? `<span class="bad">▼${-d}</span>` : '<span class="muted">–</span>';
+
+function scoreboard() {
+  const g = S.game;
+  return g.standings.map((s, i) => `<div class="sb-row ${s.id === S.you ? 'me' : ''}">
+    <span class="sb-rank">${i + 1}</span><span class="dot" style="background:${partyColor(s.id)}"></span>
+    <span class="sb-name">${traitIcon(s.id)} ${esc(partyName(s.id))}${partnersOf(s.id).length ? ' <span title="in a coalition">🤝</span>' : ''}</span>
+    <span class="sb-seats"><b>${s.seats}</b> ${deltaHtml(seatDelta(s.id))}</span>
+    <span class="sb-money">${money(s.money)}</span>
+    <span class="sb-status">${S.room.phase === 'planning' ? (g.submitted.includes(s.id) ? '✓' : '…') : ''}</span></div>`).join('');
 }
 
 function renderGame() {
   const g = S.game;
-  if (S.planRound !== g.round) { S.plan = g.my_pending ? [...g.my_pending] : []; S.planRound = g.round; }
-  if (S.lastRound !== null && g.last_report && g.last_report.round !== S.lastRound) {
-    toast(`Round ${g.last_report.round} results are in — you earned ${money(g.last_report.income[S.you]?.total ?? 0)}`, true);
+  if (S.planRound !== g.round) {
+    S.plan = g.my_pending ? [...g.my_pending] : []; S.planRound = g.round; S.resultsHidden = false;
   }
-  S.lastRound = g.last_report?.round ?? 0;
+  S.targets = [];
   renderTopbar();
 
   if (!S.mapView || !document.contains(S.mapView.svg)) {
@@ -333,18 +442,30 @@ function renderGame() {
         <div class="legend" id="legend"></div>
       </div>
       <div class="side">
+        <div class="event-card" id="eventcard"></div>
+        <div class="scoreboard" id="scoreboard"></div>
         <div class="tabs" id="tabs"></div>
         <div class="panel" id="panel"></div>
         <div class="submit-bar" id="submitbar"></div>
       </div>
     </div>`;
-    S.mapView = new MapView($('#mapbox'), S.map, { onSelect: id => { S.selected = id; S.tab = 'region'; S.panelTab = null; renderGame(); $('#panel').scrollTop = 0; }, tooltip });
+    S.mapView = new MapView($('#mapbox'), S.map, { onSelect: id => { S.selected = id; S.tab = 'region'; renderGame(); $('#panel').scrollTop = 0; }, tooltip });
   }
+  if (!isMobile() && S.tab === 'map') S.tab = 'region';
+  const gameEl = $('.game');
+  gameEl.classList.toggle('mobile', isMobile());
+  gameEl.dataset.tab = S.tab;
   const modes = { leader: 'Leaders', sector: 'Sectors', ideology: 'Ideology', match: 'My fit', invest: 'Investors' };
   $('#maptools').innerHTML = Object.entries(modes).map(([k, v]) => `<button class="small ${S.mapMode === k ? 'on' : ''}" data-mode="${k}">${v}</button>`).join('')
-    + `<span class="muted" style="margin-left:auto;font-size:12px">Click a province to campaign · numbers = ${esc(S.map.seat_label)}</span>`;
+    + `<span class="muted hint" style="margin-left:auto;font-size:12px">${isMobile() ? 'Tap' : 'Click'} a ${RL().toLowerCase()} to campaign there · ${isMobile() ? 'pinch' : 'scroll'} to zoom</span>`;
+  $('#maptools').insertAdjacentHTML('afterbegin', `<span class="seg"><button class="small ${S.view === '2d' ? 'on' : ''}" data-view="2d">2D map</button><button class="small ${S.view === '3d' ? 'on' : ''}" data-view="3d">🎲 3D board</button></span>`);
   $('#maptools').querySelectorAll('[data-mode]').forEach(b => b.onclick = () => { S.mapMode = b.dataset.mode; renderGame(); });
+  $('#maptools').querySelectorAll('[data-view]').forEach(b => b.onclick = () => {
+    S.view = b.dataset.view; try { localStorage.setItem('view', S.view); } catch {}
+    renderGame();
+  });
   S.mapView.paint(colorOf, S.selected);
+  syncBoard();
 
   const totals = g.last_report?.seats || {};
   const allSeats = S.map.regions.reduce((s, r) => s + r.seats, 0);
@@ -355,90 +476,95 @@ function renderGame() {
     : S.mapMode === 'ideology' ? '<span><span class="dot" style="background:#e05263"></span>left</span><span><span class="dot" style="background:#3d8bd4"></span>right</span>'
     : S.mapMode === 'match' ? '<span><span class="dot" style="background:#2d8f5c"></span>matches your ideology</span><span><span class="dot" style="background:#5a1f28"></span>opposite</span>'
     : [...g.standings.map(s => `<span><span class="dot" style="background:${partyColor(s.id)}"></span>${esc(partyName(s.id))} ${s.seats}</span>`), `<span><span class="dot" style="background:${IND_COLOR}"></span>Independent ${totals[IND] ?? allSeats}</span>`].join('')
-      + (S.mapMode === 'invest' ? '<span class="muted">(colored = investor holds ≥3× the rest, grey = contested)</span>' : '');
+      + (S.mapMode === 'invest' ? '<span class="muted">(colored = owner of the economy, grey = invested but nobody owns it yet)</span>' : '');
 
-  const tabs = { region: 'Province', campaign: 'Campaign', economy: 'Economy', plan: `Plan (${S.plan.length})`, standings: 'Standings', report: 'Report', chat: 'Chat' };
-  $('#tabs').innerHTML = Object.entries(tabs).map(([k, v]) => `<button class="${S.tab === k ? 'on' : ''}" data-tab="${k}">${v}</button>`).join('');
-  $('#tabs').querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; renderGame(); });
+  $('#scoreboard').innerHTML = scoreboard();
+  const ev = g.event;
+  $('#eventcard').innerHTML = `<span class="ev-icon">${ev.icon}</span><div><b>Round ${g.round}: ${esc(ev.title)}</b><div>${esc(ev.text)}</div></div>`;
+  $('#eventcard').onclick = () => $('#eventcard').classList.toggle('open');
+  const incoming = g.proposals.filter(([, to]) => to === S.you).length;
+  const tabs = { ...(isMobile() ? { map: 'Map' } : {}), region: RL(), campaign: isMobile() ? 'Ads' : 'Campaign', economy: 'Economy',
+    plan: `Plan${S.plan.length ? ` (${S.plan.length})` : ''}`, diplomacy: `Diplomacy${incoming ? ` (${incoming}!)` : ''}`,
+    standings: 'Standings', report: isMobile() ? 'News' : 'Report', chat: 'Chat' };
+  $('#tabs').innerHTML = Object.entries(tabs).map(([k, v]) => `<button class="${S.tab === k ? 'on' : ''}" data-tab="${k}"><span class="ti">${TAB_ICON[k]}</span><span class="tl">${v}</span></button>`).join('');
+  $('#tabs').querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; tooltip(null); renderGame(); $('#panel').scrollTop = 0; });
+  $('#tabs .on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 
-  // don't clobber a half-typed amount when someone else's action triggers a broadcast
-  const active = document.activeElement;
-  if (!(active && $('#panel')?.contains(active) && active.tagName === 'INPUT' && S.panelTab === S.tab)) {
-    S.panelTab = S.tab;
-    $('#panel').innerHTML = ({ region: regionPanel, campaign: campaignPanel, economy: economyPanel, plan: planPanel, standings: standingsPanel, report: reportPanel, chat: () => `<div class="chat" style="height:100%">${chatHtml()}</div>` })[S.tab]();
-    bindPanel();
-  }
+  const panel = $('#panel');
+  const typing = S.tab === 'chat' && document.activeElement?.id === 'chatin' ? $('#chatin').value : null;
+  const scroll = panel.scrollTop;
+  panel.innerHTML = ({ map: () => '', region: regionPanel, campaign: campaignPanel, economy: economyPanel, plan: planPanel, diplomacy: diplomacyPanel, standings: standingsPanel, report: reportPanel, chat: () => `<div class="chat" style="height:100%">${chatHtml()}</div>` })[S.tab]();
+  panel.scrollTop = scroll;
+  bindPanel();
+  if (typing !== null) { $('#chatin').value = typing; $('#chatin').focus(); }
   renderSubmitBar();
+  renderResults();
   if (g.finished) renderFinal();
-}
-
-function amountInput(key, def = 100) {
-  // entered in thousands: 100 = 100K, 1500 = 1.5M
-  return `<div class="row"><input type="number" min="${S.game.rules.min_action / 1000}" step="10" value="${def}" data-amount="${key}"><span class="auto muted">K</span><button class="auto primary" data-add="${key}">Add to plan</button></div>`;
+  if (!g.finished && !localStorage.getItem('tut:' + S.room.code)) { localStorage.setItem('tut:' + S.room.code, '1'); showTutorial(0); }
 }
 
 function regionPanel() {
-  if (!S.selected) return '<p class="muted">Select a province on the map to see polls, seats and investment, and to plan rallies there.</p>';
+  if (!S.selected) return `${isMobile() ? '<button class="primary" data-tab-go="map" style="margin-bottom:10px">🗺️ Open the map</button>' : ''}<h2>Pick a ${RL().toLowerCase()}</h2><p class="muted">Click any ${RL().toLowerCase()} on the map to rally there, invest in its economy or run attack ads. National and sector-wide ads are in the <b>Campaign</b> tab; industry investments in <b>Economy</b>.</p>`;
   const r = region(S.selected), g = S.game.regions[S.selected];
+  const back = isMobile() ? `<button class="small" data-tab-go="map" style="margin-bottom:8px">← Back to map</button>` : '';
   const votes = Object.entries(g.support).concat([[IND, g.independent]]).sort((a, b) => b[1] - a[1]);
   const vtotal = votes.reduce((s, [, v]) => s + v, 0);
   const inv = Object.entries(g.invest).sort((a, b) => b[1] - a[1]);
   const itotal = inv.reduce((s, [, v]) => s + v, 0);
-  const d = dominance(g.invest);
-  const mult = ideoMult(myRight(), r.right), pen = mismatch(myRight(), r.right);
+  const ctl = control(g.invest, g.owner, g.pool);
+  const mult = effMult(S.you, r), pen = mismatch(myRight(), r.right) * (S.game.traits[S.you] === 'populist' ? 0.5 : 1);
   const bonus = r.seats * S.game.rules.leader_bonus_per_seat;
-  const opponents = S.game.standings.filter(s => s.id !== S.you);
+  const opponents = S.game.standings.filter(s => s.id !== S.you && !partnersOf(S.you).includes(s.id));
+  if (!opponents.some(o => o.id === S.negTarget)) S.negTarget = opponents[0]?.id;
   return `
-    <div class="between"><h2>${esc(r.name)}</h2><span class="tag" style="background:${SECTOR_COLOR[r.sector]}">${SECTOR_ICON[r.sector]} ${r.sector}</span></div>
+    ${back}<div class="between"><h2>${esc(r.name)} <span class="muted" style="font-weight:500">· ${r.seats} ${esc(S.map.seat_label)}</span></h2><span class="tag" style="background:${SECTOR_COLOR[r.sector]}">${SECTOR_ICON[r.sector]} ${r.sector}</span></div>
     ${ideoBar(Math.round((1 - r.right) * 100))}
     <dl class="kv" style="margin-top:10px">
-      <dt>${esc(S.map.seat_label)}</dt><dd><b>${r.seats}</b></dd>
       <dt>Leader</dt><dd>${g.leader ? `<b style="color:${partyColor(g.leader)}">${esc(partyName(g.leader))}</b>` : 'none'}</dd>
-      <dt>Your campaign effectiveness</dt><dd class="${mult >= 1 ? 'good' : mult < 0.8 ? 'bad' : ''}">×${mult.toFixed(2)}</dd>
-      <dt>Leadership bonus if you lead</dt><dd>${money(bonus * (1 - pen))}/round ${pen > 0 ? `<span class="bad">(−${pct(pen)} ideology mismatch)</span>` : ''}</dd>
-      <dt>Local economy</dt><dd>${money(g.pool)}/round, full payout at ${money(g.pool * S.game.saturation.region)} invested</dd>
+      <dt>Your ideology fit</dt><dd class="${mult >= 1 ? 'good' : mult < 0.8 ? 'bad' : ''}">×${mult.toFixed(2)} campaign effect</dd>
+      <dt>If you lead it</dt><dd>${money(bonus * (1 - pen))}/round ${pen > 0 ? `<span class="bad">(−${pct(pen)} mismatch)</span>` : ''}</dd>
     </dl>
-    <h3>Polls (current support)</h3>${bars(votes, vtotal, v => pct(v / vtotal))}
+    <div class="action"><div class="title">📣 Rally & ground campaign</div><div class="desc">Wins votes here (×${mult.toFixed(2)} for your ideology fit).</div>${spender({ type: 'rally', region: r.id })}</div>
+    <div class="action"><div class="title">🏗️ Invest in the local economy</div><div class="desc">Permanent stake in ${money(g.pool)}/round. First to ≥${S.game.rules.dominance_ratio}× everyone else combined owns it: ${pct(S.game.rules.dominance_share)} for good.</div>${controlNote(ctl)}${spender({ type: 'invest_region', region: r.id })}</div>
+    ${opponents.length ? `<div class="action"><div class="title">🗯️ Attack ad</div><div class="desc">Removes a rival's support here.</div>
+      <div class="chips" style="margin-bottom:6px">${opponents.map(o => `<button class="chip ${o.id === S.negTarget ? 'on' : ''}" data-negtarget="${o.id}"><span class="dot" style="background:${partyColor(o.id)};width:9px;height:9px"></span> ${esc(partyName(o.id))}</button>`).join('')}</div>
+      ${spender({ type: 'ad', kind: 'negative', region: r.id, target: S.negTarget })}</div>` : ''}
+    <h3>Polls</h3>${bars(votes, vtotal, v => pct(v / vtotal))}
     <h3>Seats (last election)</h3>${Object.keys(g.seats).length ? bars(Object.entries(g.seats), r.seats, v => v) : '<div class="muted">No election yet</div>'}
-    <h3>Investors</h3>${bars(inv, itotal, v => money(v))}
-    ${d ? `<div class="muted" style="font-size:12px;margin-top:6px">${d.contested ? `${esc(partyName(d.id))} needs ${money(d.need)} more to control 80% of this economy` : d.solo ? `${esc(partyName(d.id))} is the only investor` : `<b style="color:${partyColor(d.id)}">${esc(partyName(d.id))}</b> controls 80% of this economy`}</div>` : ''}
-    <h3>Actions</h3>
-    <div class="action"><div class="title">📣 Rally & ground campaign</div><div class="desc">Adds support here ×${mult.toFixed(2)} (ideology fit). Support fades ${pct(S.game.rules.support_decay)} per round.</div>${amountInput('rally')}</div>
-    <div class="action"><div class="title">🏗️ Invest in local economy</div><div class="desc">Permanent stake. Hold ≥${S.game.rules.dominance_ratio}× everyone else combined to take ${pct(S.game.rules.dominance_share)} of the income.</div>${amountInput('invest_region')}</div>
-    ${opponents.length ? `<div class="action"><div class="title">🗯️ Attack ad</div><div class="desc">Cuts a rival's support here by ${S.game.rules.negative_efficiency}× the spend.</div>
-      <select id="negtarget" style="margin-bottom:6px">${opponents.map(o => `<option value="${o.id}">${esc(partyName(o.id))}</option>`).join('')}</select>${amountInput('negative')}</div>` : ''}`;
+    <h3>Investors</h3>${bars(inv, itotal, v => money(v))}`;
 }
 
 function campaignPanel() {
+  S.socialSector ??= 'trade';
   return `<h2>Campaign ads</h2>
-    <div class="action"><div class="title">📺 National TV ad</div><div class="desc">Reaches every province, weighted by seats (×${S.game.rules.tv_efficiency} total efficiency, times ideology fit per province).</div>${amountInput('tv', 200)}</div>
-    <div class="action"><div class="title">📱 Social media ads</div><div class="desc">Targets all provinces of one sector (×${S.game.rules.social_efficiency} efficiency).</div>
-      <select id="socialsector" style="margin-bottom:6px">${SECTORS.map(s => `<option value="${s}">${SECTOR_ICON[s]} ${s}</option>`).join('')}</select>${amountInput('social', 150)}</div>
-    <p class="muted" style="font-size:12px">For rallies and attack ads, click a province on the map.</p>`;
+    <div class="action"><div class="title">📺 National TV ad</div><div class="desc">Reaches every ${RL().toLowerCase()} at once, weighted by ${esc(S.map.seat_label)}.</div>${spender({ type: 'ad', kind: 'tv' })}</div>
+    <div class="action"><div class="title">📱 Social media ads</div><div class="desc">Targets every ${RL().toLowerCase()} of one sector — more efficient than TV.</div>
+      <div class="chips" style="margin-bottom:6px">${SECTORS.map(s => `<button class="chip ${s === S.socialSector ? 'on' : ''}" data-social="${s}">${SECTOR_ICON[s]} ${s}</button>`).join('')}</div>
+      ${spender({ type: 'ad', kind: 'social', sector: S.socialSector })}</div>
+    <p class="muted" style="font-size:12px">Rallies and attack ads: click a ${RL().toLowerCase()} on the map.</p>`;
 }
 
 function economyPanel() {
   const g = S.game;
   return `<h2>Sector economy</h2>
-    <p class="muted" style="font-size:12px">Each sector pays out every round. Hold ≥${g.rules.dominance_ratio}× everyone else's combined investment to take ${pct(g.rules.dominance_share)}; the rest is split among the other investors. Market conditions shift each round.</p>
+    <p class="muted" style="font-size:12px">Each sector pays every round. The first to invest ≥${g.rules.dominance_ratio}× everyone else combined <b>owns it for good</b>: ${pct(g.rules.dominance_share)} of its income every round, whatever others invest later. Market shifts each round.</p>
     ${SECTORS.map(s => {
       const inv = Object.entries(g.sectors[s]).sort((a, b) => b[1] - a[1]);
       const total = inv.reduce((a, [, v]) => a + v, 0);
-      const d = dominance(g.sectors[s]);
+      const ctl = control(g.sectors[s], g.sector_owner[s], g.sector_pools[s]);
       const m = g.market[s];
       return `<div class="sector-card">
-        <div class="between"><b>${SECTOR_ICON[s]} ${s}</b><span>${money(g.sector_pools[s])}/round <span class="${m >= 1 ? 'good' : 'bad'}">${m >= 1 ? '▲' : '▼'}${Math.round((m - 1) * 100)}%</span></span></div>
-        <div class="muted" style="font-size:12px">Full payout at ${money(g.sector_pools[s] * g.saturation.sector)} invested · currently ${money(total)}</div>
-        ${bars(inv, total, v => money(v))}
-        ${d && !d.solo ? `<div class="muted" style="font-size:12px">${d.contested ? `${esc(partyName(d.id))} needs ${money(d.need)} more for control` : `<b style="color:${partyColor(d.id)}">${esc(partyName(d.id))}</b> controls this sector`}</div>` : ''}
-        <div style="margin-top:6px">${amountInput('sector:' + s)}</div></div>`;
+        <div class="between"><b>${SECTOR_ICON[s]} ${s}${g.sector_owner[s] ? ` <span class="dot" title="owner" style="background:${partyColor(g.sector_owner[s])}"></span>🔒` : ''}</b><span>${money(g.sector_pools[s])}/round <span class="${m >= 1 ? 'good' : 'bad'}">${m >= 1 ? '▲' : '▼'}${Math.abs(Math.round((m - 1) * 100))}%</span></span></div>
+        ${inv.length ? bars(inv, total, v => money(v)) : ''}
+        ${controlNote(ctl)}
+        ${spender({ type: 'invest_sector', sector: s })}</div>`;
     }).join('')}`;
 }
 
 function planPanel() {
   return `<h2>This round's plan</h2>
-    ${S.plan.length ? S.plan.map((a, i) => `<div class="plan-item"><span>${describe(a)}</span><span>${money(a.amount)} ${S.game.my_pending ? '' : `<button class="small danger" data-rm="${i}">✕</button>`}</span></div>`).join('')
-      + `<div class="plan-item"><b>Total</b><b>${money(planTotal())}</b></div>` : '<p class="muted">Nothing planned yet. Rally in provinces, run ads, and invest. Unspent funds carry over.</p>'}`;
+    ${S.plan.length ? S.plan.map(a => `<div class="plan-block"><div class="between"><span>${describe(a)}</span></div>${spender({ ...a, amount: undefined })}</div>`).join('')
+      + `<div class="plan-item"><b>Total</b><b>${money(planTotal())}</b></div>` : '<p class="muted">Nothing planned yet. Unspent funds carry over to the next round.</p>'}`;
 }
 
 function standingsPanel() {
@@ -450,73 +576,206 @@ function standingsPanel() {
     const pts = hist.map((h, i) => `${hist.length > 1 ? (i / (hist.length - 1)) * W : W / 2},${H - (h[s.id] || 0) / maxSeats * H}`).join(' ');
     return `<polyline points="${pts}" fill="none" stroke="${partyColor(s.id)}" stroke-width="2"/>`;
   }).join('');
+  const majority = Math.floor(maxSeats / 2) + 1;
+  const bySector = id => SECTORS.map(sec => S.map.regions.filter(r => r.sector === sec && g.regions[r.id].leader === id).length);
   return `<h2>Standings</h2>
-    <table class="table"><tr><th>Party</th><th>Seats</th><th>Led</th><th>Funds</th><th>Status</th></tr>
-    ${g.standings.map((s, i) => `<tr><td>${i === 0 && hist.length ? '<span class="crown">♛</span> ' : ''}<span class="dot" style="background:${partyColor(s.id)};width:9px;height:9px"></span> ${esc(partyName(s.id))}${s.id === S.you ? ' (you)' : ''}</td>
-      <td>${s.seats}</td><td>${s.regions_led}</td><td>${money(s.money)}</td><td>${g.submitted.includes(s.id) ? '<span class="badge ok">ready</span>' : '<span class="badge">planning</span>'}</td></tr>`).join('')}</table>
-    <h3>Seats over time</h3>
-    ${hist.length ? `<svg viewBox="-4 -4 ${W + 8} ${H + 8}" style="width:100%">${lines}</svg>` : '<p class="muted">After the first election.</p>'}
-    <p class="muted" style="font-size:12px">Majority: ${Math.floor(maxSeats / 2) + 1} seats. The game ends after round ${g.rounds} once every province has a winner (overtime until then, max ${g.max_rounds} rounds). Most seats wins.</p>
+    <div class="table-wrap"><table class="table"><tr><th>#</th><th>Party</th><th>${esc(S.map.seat_label)}</th><th>Δ</th><th>Led</th><th>Funds</th></tr>
+    ${g.standings.map((s, i) => `<tr class="${s.id === S.you ? 'me' : ''}"><td>${i === 0 && hist.length ? '<span class="crown">♛</span>' : i + 1}</td><td style="text-align:left"><span class="dot" style="background:${partyColor(s.id)};width:9px;height:9px"></span> ${esc(partyName(s.id))}${s.id === S.you ? ' (you)' : ''}</td>
+      <td><b>${s.seats}</b></td><td>${deltaHtml(seatDelta(s.id))}</td><td>${s.regions_led}</td><td>${money(s.money)}</td></tr>`).join('')}</table></div>
+    <div class="muted" style="font-size:12px;margin-top:6px">Majority: ${majority}. ${g.standings[0]?.seats >= majority ? `<b style="color:${partyColor(g.standings[0].id)}">${esc(partyName(g.standings[0].id))} holds a majority.</b>` : 'Nobody holds a majority.'}</div>
+    <h3>${esc(S.map.seat_label)} over time</h3>
+    ${hist.length ? `<svg viewBox="-4 -4 ${W + 8} ${H + 8}" style="width:100%"><line x1="0" x2="${W}" y1="${H - majority / maxSeats * H}" y2="${H - majority / maxSeats * H}" stroke="#8c98b3" stroke-dasharray="4 4" stroke-width="1"/>${lines}</svg>` : '<p class="muted">After the first election.</p>'}
+    <h3>${RL()}s led by sector</h3>
+    <table class="table"><tr><th>Party</th>${SECTORS.map(s => `<th title="${s}">${SECTOR_ICON[s]}</th>`).join('')}</tr>
+    ${g.standings.map(s => `<tr><td><span class="dot" style="background:${partyColor(s.id)};width:9px;height:9px"></span> ${esc(partyName(s.id))}</td>${bySector(s.id).map(n => `<td>${n}</td>`).join('')}</tr>`).join('')}</table>
+    <p class="muted" style="font-size:12px">Game ends after round ${g.rounds} once every ${RL().toLowerCase()} has a winner (overtime until then, max ${g.max_rounds} rounds). Most ${esc(S.map.seat_label)} wins.</p>
     ${g.unclaimed.length ? `<h3>No winner yet (${g.unclaimed.length})</h3><div style="font-size:12px">${g.unclaimed.map(id => esc(region(id).name)).join(', ')}</div>` : ''}`;
+}
+
+function diplomacyPanel() {
+  const g = S.game, totals = Object.fromEntries(g.standings.map(s => [s.id, s.seats]));
+  const all = S.map.regions.reduce((t, r) => t + r.seats, 0), majority = Math.floor(all / 2) + 1;
+  const mine = partnersOf(S.you), group = [S.you, ...mine];
+  const groupSeats = group.reduce((t, id) => t + (totals[id] || 0), 0);
+  const incoming = g.proposals.filter(([, to]) => to === S.you).map(([from]) => from);
+  const outgoing = g.proposals.filter(([from]) => from === S.you).map(([, to]) => to);
+  const others = g.standings.filter(s => s.id !== S.you && !mine.includes(s.id));
+  return `<h2>Diplomacy</h2>
+    <p class="muted" style="font-size:12px">A coalition that holds a <b>majority (${majority} ${esc(S.map.seat_label)})</b> at the end of the game wins together. Partners can't run attack ads against each other. Anyone can leave a coalition at any time.</p>
+    ${incoming.length ? `<h3>Offers to you</h3>${incoming.map(id => `<div class="action between"><span>🤝 <b style="color:${partyColor(id)}">${esc(partyName(id))}</b> invites you into a coalition</span>
+      <span class="row auto"><button class="small primary" data-accept="${id}">Accept</button><button class="small" data-decline="${id}">Decline</button></span></div>`).join('')}` : ''}
+    <h3>Your coalition</h3>
+    ${mine.length ? `<div class="action"><div>${group.map(id => `<span class="dot" style="background:${partyColor(id)};width:9px;height:9px"></span> ${esc(partyName(id))} (${totals[id] || 0})`).join(' + ')}</div>
+      <div class="between" style="margin-top:6px"><span>${groupSeats}/${majority} for a majority ${groupSeats >= majority ? '<span class="good">✓ majority!</span>' : ''}</span><button class="small danger" id="leavecoal">Leave coalition</button></div>
+      <div class="ideo-bar" style="margin-top:6px"><div style="width:${Math.min(100, 100 * groupSeats / majority)}%;background:var(--good)"></div></div></div>`
+      : '<p class="muted">You are governing alone for now.</p>'}
+    <h3>Other parties</h3>
+    ${others.map(s => `<div class="action between"><span><span class="dot" style="background:${partyColor(s.id)};width:9px;height:9px"></span> ${traitIcon(s.id)} <b>${esc(partyName(s.id))}</b> · ${s.seats} · ${player(s.id)?.left ?? '?'}% left${partnersOf(s.id).length ? ' · 🤝 in a coalition' : ''}</span>
+      ${outgoing.includes(s.id) ? '<span class="muted">offer sent…</span>' : `<button class="small" data-propose="${s.id}">Propose coalition</button>`}</div>`).join('') || '<p class="muted">Everyone is already in your coalition.</p>'}
+    <h3>💸 Send money</h3>
+    <p class="muted" style="font-size:12px">Pay another party — to seal a deal, support a partner or buy a favour. Arrives when the round resolves. Agree terms in Chat.</p>
+    <div class="chips" style="margin-bottom:6px">${g.standings.filter(s => s.id !== S.you).map(s => `<button class="chip ${s.id === S.transferTo ? 'on' : ''}" data-transferto="${s.id}"><span class="dot" style="background:${partyColor(s.id)};width:9px;height:9px"></span> ${esc(partyName(s.id))}</button>`).join('')}</div>
+    ${S.transferTo ? spender({ type: 'transfer', target: S.transferTo }) : '<p class="muted" style="font-size:12px">Pick a party first.</p>'}`;
+}
+
+function incomeHtml(inc) {
+  return `<dl class="kv"><dt>Base</dt><dd>${money(inc.base)}</dd><dt>Leadership bonuses</dt><dd>${money(inc.leadership)}</dd>
+    <dt>Ideology mismatch</dt><dd class="bad">${money(inc.penalty)}</dd><dt>${RL()} economies</dt><dd>${money(inc.regions)}</dd>
+    <dt>Sectors</dt><dd>${money(inc.sectors)}</dd>${inc.event ? `<dt>Event bonus</dt><dd class="good">${money(inc.event)}</dd>` : ''}<dt><b>Total</b></dt><dd><b class="good">${money(inc.total)}</b></dd></dl>`;
 }
 
 function reportPanel() {
   const rep = S.game.last_report;
   if (!rep) return '<p class="muted">The first results come in after round 1.</p>';
-  const inc = rep.income[S.you] || {};
-  return `<h2>Round ${rep.round} results</h2>
-    <h3>Your income</h3>
-    <dl class="kv"><dt>Base</dt><dd>${money(inc.base)}</dd><dt>Leadership bonuses</dt><dd>${money(inc.leadership)}</dd>
-      <dt>Ideology mismatch</dt><dd class="bad">${money(inc.penalty)}</dd><dt>Province economies</dt><dd>${money(inc.regions)}</dd>
-      <dt>Sectors</dt><dd>${money(inc.sectors)}</dd><dt><b>Total</b></dt><dd><b class="good">${money(inc.total)}</b></dd></dl>
-    <h3>All parties</h3>
-    <table class="table"><tr><th>Party</th><th>Seats</th><th>Income</th></tr>
-    ${Object.entries(rep.income).map(([id, v]) => `<tr><td><span class="dot" style="background:${partyColor(id)};width:9px;height:9px"></span> ${esc(partyName(id))}</td><td>${rep.seats[id] || 0}</td><td>${money(v.total)}</td></tr>`).join('')}</table>
+  return `<h2>Round ${rep.round} results</h2><h3>Your income</h3>${incomeHtml(rep.income[S.you] || {})}
     <h3>News</h3>${rep.events.length ? rep.events.map(e => `<div>• ${esc(e)}</div>`).join('') : '<div class="muted">A quiet round.</div>'}`;
 }
 
 function bindPanel() {
   const p = $('#panel');
-  p.querySelectorAll('[data-add]').forEach(b => b.onclick = () => {
-    const key = b.dataset.add, amount = Math.round(+p.querySelector(`[data-amount="${key}"]`).value * 1000);
-    if (key === 'rally' || key === 'invest_region') addAction({ type: key, region: S.selected, amount });
-    else if (key === 'negative') addAction({ type: 'ad', kind: 'negative', region: S.selected, target: $('#negtarget').value, amount });
-    else if (key === 'tv') addAction({ type: 'ad', kind: 'tv', amount });
-    else if (key === 'social') addAction({ type: 'ad', kind: 'social', sector: $('#socialsector').value, amount });
-    else if (key.startsWith('sector:')) addAction({ type: 'invest_sector', sector: key.slice(7), amount });
+  p.querySelectorAll('[data-spend]').forEach(b => b.onclick = () => {
+    const d = b.dataset.delta;
+    spend(S.targets[+b.dataset.spend], d === 'max' || d === 'clear' ? d : +d);
   });
-  p.querySelectorAll('[data-amount]').forEach(i => i.onkeydown = e => e.key === 'Enter' && p.querySelector(`[data-add="${i.dataset.amount}"]`).click());
-  p.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { S.plan.splice(+b.dataset.rm, 1); renderGame(); });
+  p.querySelectorAll('[data-negtarget]').forEach(b => b.onclick = () => { S.negTarget = b.dataset.negtarget; renderGame(); });
+  p.querySelectorAll('[data-social]').forEach(b => b.onclick = () => { S.socialSector = b.dataset.social; renderGame(); });
+  p.querySelectorAll('[data-tab-go]').forEach(b => b.onclick = () => { S.tab = b.dataset.tabGo; renderGame(); });
+  p.querySelectorAll('[data-propose]').forEach(b => b.onclick = () => send({ t: 'propose', target: b.dataset.propose }));
+  p.querySelectorAll('[data-accept]').forEach(b => b.onclick = () => send({ t: 'respond', from: b.dataset.accept, accept: true }));
+  p.querySelectorAll('[data-decline]').forEach(b => b.onclick = () => send({ t: 'respond', from: b.dataset.decline, accept: false }));
+  p.querySelectorAll('[data-transferto]').forEach(b => b.onclick = () => { S.transferTo = b.dataset.transferto; renderGame(); });
+  $('#leavecoal')?.addEventListener('click', () => confirm('Leave your coalition?') && send({ t: 'leave_coalition' }));
   if (S.tab === 'chat') bindChat();
 }
 
 function renderSubmitBar() {
-  const g = S.game;
-  if (g.finished) { $('#submitbar').innerHTML = '<b>Game over.</b>'; return; }
+  const g = S.game, bar = $('#submitbar');
+  if (g.finished) { bar.innerHTML = '<b>Game over.</b>'; return; }
+  if (S.room.phase === 'results') {
+    const done = S.room.acks.includes(S.you);
+    bar.innerHTML = `<div class="between"><span>${done ? '<span class="good">✓ Waiting for the others…</span>' : 'Round results are in.'}</span>
+      <span class="row auto"><button class="small" id="showres">Show results</button>${done ? '' : '<button class="primary" id="nextturn">Go to next turn ▶</button>'}</span></div>`;
+    $('#showres').onclick = () => { S.resultsHidden = false; renderGame(); };
+    $('#nextturn')?.addEventListener('click', () => send({ t: 'next' }));
+    return;
+  }
   const waiting = g.standings.filter(s => !g.submitted.includes(s.id)).map(s => partyName(s.id));
-  $('#submitbar').innerHTML = g.my_pending
+  bar.innerHTML = g.my_pending
     ? `<div class="between"><span class="good">✓ Plan submitted. Waiting for: ${esc(waiting.join(', ') || '—')}</span><button class="small" id="unsubmit">Edit plan</button></div>`
-    : `<div class="between"><span>${S.plan.length} actions · ${money(planTotal())}</span><button class="primary" id="submit">End turn</button></div>`;
+    : `<div class="between"><span>${S.plan.length} actions · ${money(planTotal())} · <span class="muted">${money(budget())} left</span></span><button class="primary" id="submit">End turn</button></div>`;
   $('#unsubmit')?.addEventListener('click', () => send({ t: 'unsubmit' }));
-  $('#submit')?.addEventListener('click', () => send({ t: 'submit', actions: S.plan }));
+  $('#submit')?.addEventListener('click', () => {
+    if (!S.plan.length && !confirm('End your turn without spending anything?')) return;
+    send({ t: 'submit', actions: S.plan });
+  });
+}
+
+function overlay(id, html) {
+  let o = document.getElementById(id);
+  if (!html) { o?.remove(); return null; }
+  if (!o) { o = document.createElement('div'); o.id = id; o.className = 'overlay'; document.body.appendChild(o); }
+  o.innerHTML = html;
+  return o;
+}
+
+function renderResults() {
+  const g = S.game, rep = g.last_report;
+  if (S.room.phase !== 'results' || g.finished || S.resultsHidden || !rep) return overlay('results-ov', null);
+  const done = S.room.acks.includes(S.you);
+  const waiting = S.room.members.filter(m => !S.room.acks.includes(m.id) && m.online).map(m => m.party);
+  overlay('results-ov', `<div class="card wide">
+    <div class="between"><h2>🗳️ Round ${rep.round} results</h2><span class="muted">${g.overtime ? `<span class="bad">Overtime</span> · ` : ''}${g.unclaimed.length} ${rls()} without a winner</span></div>
+    <div class="table-wrap"><table class="table"><tr><th>#</th><th>Party</th><th>${esc(S.map.seat_label)}</th><th>Change</th><th class="opt">${RL()}s led</th><th>Income</th><th class="opt">Funds</th></tr>
+    ${g.standings.map((s, i) => `<tr class="${s.id === S.you ? 'me' : ''}"><td>${i === 0 ? '<span class="crown">♛</span>' : i + 1}</td>
+      <td style="text-align:left"><span class="dot" style="background:${partyColor(s.id)};width:9px;height:9px"></span> ${esc(partyName(s.id))}${s.id === S.you ? ' (you)' : ''}</td>
+      <td><b>${s.seats}</b></td><td>${deltaHtml(seatDelta(s.id))}</td><td class="opt">${s.regions_led}</td><td class="good">+${money(rep.income[s.id]?.total ?? 0)}</td><td class="opt">${money(s.money)}</td></tr>`).join('')}
+      <tr><td></td><td style="text-align:left"><span class="dot" style="background:${IND_COLOR};width:9px;height:9px"></span> Independents</td><td>${rep.seats[IND] || 0}</td><td>${deltaHtml(seatDelta(IND))}</td><td class="opt"></td><td></td><td class="opt"></td></tr></table></div>
+    <div class="grid2">
+      <div><h3>Your income</h3>${incomeHtml(rep.income[S.you] || {})}</div>
+      <div><h3>News</h3><div class="news">${rep.events.length ? rep.events.map(e => `<div>• ${esc(e)}</div>`).join('') : '<div class="muted">A quiet round.</div>'}</div></div>
+    </div>
+    <div class="event-card" style="margin-top:12px"><span class="ev-icon">${g.event.icon}</span><div><b>Next round: ${esc(g.event.title)}</b><div>${esc(g.event.text)}</div></div></div>
+    <div class="between" style="margin-top:14px">
+      <span class="muted" style="font-size:12px">${done ? `Waiting for: ${esc(waiting.join(', ') || '—')}` : `${S.room.acks.length}/${S.room.members.length} ready`}</span>
+      <span class="row auto"><button id="hideres">View map</button>${done ? '<button disabled>✓ Ready</button>' : '<button class="primary" id="nextturn2">Go to next turn ▶</button>'}</span>
+    </div></div>`);
+  $('#hideres').onclick = () => { S.resultsHidden = true; renderGame(); };
+  $('#nextturn2')?.addEventListener('click', () => send({ t: 'next' }));
 }
 
 function renderFinal() {
-  if ($('.overlay') || S.dismissedFinal) return;
-  const g = S.game, w = g.standings[0];
-  const o = document.createElement('div');
-  o.className = 'overlay';
-  o.innerHTML = `<div class="card"><h2>🏆 ${esc(partyName(w.id))} wins the election!</h2>
-    <p class="muted">${w.seats} seats after ${g.seat_history.length} rounds.</p>
-    <table class="table"><tr><th>Party</th><th>Seats</th><th>Provinces led</th><th>Funds</th></tr>
+  if (S.dismissedFinal) return overlay('final-ov', null);
+  overlay('results-ov', null);
+  const g = S.game, res = g.result, w = g.standings.find(s => s.id === res.lead);
+  const names = res.winners.map(id => `<b style="color:${partyColor(id)}">${esc(partyName(id))}</b>`).join(' + ');
+  overlay('final-ov', `<div class="card wide"><h2>🏆 ${res.coalition ? `The ${names} coalition governs!` : `${names} wins the election!`}</h2>
+    <p class="muted">${res.coalition ? `${res.seats} ${esc(S.map.seat_label)} together — a majority is ${res.majority}. ${esc(partyName(res.lead))} leads the government.` : `${w.seats} ${esc(S.map.seat_label)} after ${g.seat_history.length} rounds${w.seats >= res.majority ? ' — an outright majority' : ' (no coalition reached a majority)'}.`}</p>
+    <table class="table"><tr><th>Party</th><th>${esc(S.map.seat_label)}</th><th>${RL()}s led</th><th>Funds</th></tr>
     ${g.standings.map(s => `<tr><td><span class="dot" style="background:${partyColor(s.id)};width:9px;height:9px"></span> ${esc(partyName(s.id))}</td><td>${s.seats}</td><td>${s.regions_led}</td><td>${money(s.money)}</td></tr>`).join('')}</table>
-    <div class="row" style="margin-top:14px"><button id="viewmap">View map</button><button class="primary" id="newgame">Back to lobby list</button></div></div>`;
-  document.body.appendChild(o);
-  $('#viewmap').onclick = () => { S.dismissedFinal = true; o.remove(); };
-  $('#newgame').onclick = () => { o.remove(); send({ t: 'leave' }); forgetSession(); };
+    <div class="row" style="margin-top:14px"><button id="viewmap">View map</button><button class="primary" id="newgame">Back to lobby list</button></div></div>`);
+  $('#viewmap').onclick = () => { S.dismissedFinal = true; overlay('final-ov', null); };
+  $('#newgame').onclick = () => { overlay('final-ov', null); send({ t: 'leave' }); forgetSession(); };
+}
+
+// ---------- 3D board ----------
+function disposeBoard() {
+  S.board?.dispose(); S.board = null;
+  if (S.mapView) { S.mapView.svg.style.display = ''; S.mapView.zoomUi.style.display = ''; }
+}
+async function syncBoard() {
+  if (S.board && !document.contains(S.board.el)) disposeBoard();
+  if (S.view !== '3d') { if (S.board) disposeBoard(); return; }
+  if (!S.board) {
+    if (S.boardLoading) return;
+    S.boardLoading = true;
+    try {
+      const { Board3D } = await import('./board3d.js');  // three.js loads only when the 3D view is used
+      if (S.view === '3d' && S.mapView && !S.board) {
+        S.board = new Board3D($('#mapbox'), S.map, { onSelect: id => { S.selected = id; S.tab = 'region'; renderGame(); $('#panel').scrollTop = 0; }, tooltip });
+      }
+    } catch (e) {
+      console.warn(e); toast('Could not load the 3D view');
+      S.view = '2d'; S.boardLoading = false; return renderGame();
+    }
+    S.boardLoading = false;
+  }
+  if (!S.board) return;
+  S.mapView.svg.style.display = 'none';
+  S.mapView.zoomUi.style.display = 'none';
+  S.board.paint(colorOf, S.selected, { regions: S.game.regions, partyColor });
+}
+
+// ---------- tutorial ----------
+function tutorialSteps() {
+  const rl = (S.map?.region_label || 'province').toLowerCase(), seats = S.map?.seat_label || 'seats';
+  return [
+    ['🗳️ Welcome to Election Night', `You lead a political party. Win the most <b>${esc(seats)}</b> across the map. The game lasts <b>${S.room?.rounds ?? 20} rounds</b>, and only ends once every ${rl} has a winner (overtime until then).`],
+    ['⚖️ Your ideology matters', `Every ${rl} leans left or right. Campaigning where voters share your ideology works up to <b>3× better</b> than where they don't. Use the <b>My fit</b> map view to see where you're strong.<br><br>If you win a ${rl} that doesn't match your ideology, you lose part of its leadership income.`],
+    ['📣 Spend money to campaign', `Click a ${rl} on the map, then tap the <b>+money</b> buttons to plan a rally, invest, or run an attack ad. The <b>Campaign</b> tab has national TV ads and social ads that target one sector. Your plan and remaining budget are always shown.`],
+    ['🗳️ Every round is an election', `When everyone ends their turn, every ${rl} votes. The party with the most support <b>leads</b> it, and ${esc(seats)} are shared by vote share. You must beat the grey <b>Independents</b> to win anything. Support fades 10% per round, so keep campaigning.`],
+    ['💰 Earning money', `Each round you earn:<br>• a base income<br>• a <b>leadership bonus</b> for every ${rl} you lead<br>• income from <b>${rl} economies</b> and <b>sectors</b> (🌾🏭🚢🏖️💻) you invested in.<br><br>Be the first to invest <b>3× more than everyone else combined</b> in a ${rl} or sector and you <b>own it for the rest of the game</b>: 80% of its income every round, no matter what others do.`],
+    ['🃏 Events, leaders & coalitions', `Each round starts with an <b>event card</b> (a sector boom, a scandal, a TV debate…) shown above the scoreboard, so plan around it.<br><br>Your party leader has a <b>strength</b> you picked in the lobby (hover the icons to see everyone's).<br><br>In <b>Diplomacy</b> you can form <b>coalitions</b>: if your coalition holds a majority at the end, you win together. You can also send money to seal deals.`],
+    ['▶️ Results & next turn', `After each round you'll see the standings and your income. Every player clicks <b>Go to next turn</b> to continue. Good luck!`],
+  ];
+}
+function showTutorial(i) {
+  const steps = tutorialSteps();
+  if (i < 0 || i >= steps.length) return overlay('tut-ov', null);
+  const [title, body] = steps[i];
+  const o = overlay('tut-ov', `<div class="card tutorial">
+    <div class="muted" style="font-size:12px">How to play · ${i + 1}/${steps.length}</div>
+    <h2>${title}</h2><p>${body}</p>
+    <div class="dots">${steps.map((_, j) => `<span class="${j === i ? 'on' : ''}"></span>`).join('')}</div>
+    <div class="between"><button id="tutskip">Skip</button>
+      <span class="row auto">${i ? '<button id="tutprev">Back</button>' : ''}<button class="primary" id="tutnext">${i === steps.length - 1 ? "Let's go!" : 'Next'}</button></span></div></div>`);
+  o.style.zIndex = 60;
+  $('#tutskip').onclick = () => showTutorial(-1);
+  $('#tutprev')?.addEventListener('click', () => showTutorial(i - 1));
+  $('#tutnext').onclick = () => showTutorial(i + 1);
 }
 
 // ---------- boot ----------
+if (isMobile()) S.tab = 'map';
 const code = new URLSearchParams(location.search).get('room')?.toUpperCase();
 const saved = code && JSON.parse(localStorage.getItem('session:' + code) || 'null');
 if (saved) { S.session = saved; connect(); } else renderHome();
