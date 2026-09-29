@@ -65,11 +65,12 @@ def test_fundraiser_base_income_and_grassroots_decay():
     g.event = event_card("calm")
     g.players["a"].trait = "fundraiser"
     g.players["b"].trait = "grassroots"
+    raw = 100_000 * g.campaign_mult("b", "nw")
     g.submit("a", []); g.submit("b", [{"type": "rally", "region": "nw", "amount": 100_000}]); g.submit("c", [])
     g.resolve()
     assert g.reports[-1]["income"]["a"]["base"] == pytest.approx(160_000)
-    raw = 100_000 * g.effective_multiplier("b", "nw")
-    assert g.support["nw"]["b"] == pytest.approx(raw * 0.95, rel=0.02)  # only 5% decay
+    decay = 0.1 * (0.5 + abs(g.players["b"].right - g.regions["nw"]["right"])) / 2   # grassroots halves it
+    assert g.support["nw"]["b"] == pytest.approx(raw * (1 - decay))
 
 
 def test_orator_rallies_harder():
@@ -77,10 +78,13 @@ def test_orator_rallies_harder():
     g.event = event_card("calm")
     g.players["a"].trait = "tycoon"
     g.players["b"].trait = "orator"
+    ma, mb = g.campaign_mult("a", "by"), g.campaign_mult("b", "by")
     g.submit("a", [{"type": "rally", "region": "by", "amount": 100_000}])
     g.submit("b", [{"type": "rally", "region": "by", "amount": 100_000}]); g.submit("c", [])
     g.resolve()
-    ratio = (g.support["by"]["b"] / g.effective_multiplier("b", "by")) / (g.support["by"]["a"] / g.effective_multiplier("a", "by"))
+    da = 0.1 * (0.5 + abs(g.players["a"].right - g.regions["by"]["right"]))
+    db = 0.1 * (0.5 + abs(g.players["b"].right - g.regions["by"]["right"]))
+    ratio = (g.support["by"]["b"] / mb / (1 - db)) / (g.support["by"]["a"] / ma / (1 - da))
     assert ratio == pytest.approx(1.25, rel=0.01)
 
 
@@ -99,7 +103,8 @@ def test_events_drawn_each_round_and_scandal_hits_support():
     g.event = event_card("scandal", party="a", party_name="a Party")
     g.submit("a", []); g.submit("b", []); g.submit("c", [])
     g.resolve()
-    assert g.support["by"]["a"] == pytest.approx(before * 0.75 * 0.9)
+    decay = 0.1 * (0.5 + abs(g.players["a"].right - g.regions["by"]["right"]))
+    assert g.support["by"]["a"] == pytest.approx(before * 0.75 * (1 - decay))
 
 
 def test_boom_and_donors():

@@ -14,6 +14,8 @@ import random
 from dataclasses import dataclass, field
 
 from .maps import SECTORS
+from .politics import (ISSUES, MINISTRIES, MINISTRY_SECTORS, coalition_tension, default_platform, leaning,
+                       platform_mult)
 
 INDEPENDENT = "_ind"
 
@@ -44,6 +46,9 @@ class Rules:
     mismatch_grace: float = 0.10                # ideology gap tolerated without penalty
     mismatch_penalty_slope: float = 1.5
     mismatch_penalty_cap: float = 0.9
+    reposition_step: int = 10                     # ideology points moved per repositioning
+    reposition_cost: int = 150_000
+    credibility_penalty: float = 0.85             # campaign multiplier while voters doubt a repositioned party
 
 
 SECTOR_MULT = {"technology": 1.3, "industry": 1.2, "trade": 1.1, "tourism": 1.0, "agriculture": 0.9}
@@ -77,6 +82,8 @@ def event_card(kind: str, **kw) -> dict:
         "wave_right": ("🦅", "Rightward mood swing", "Voters everywhere lean 15 points further right this round."),
         "donors":     ("🎁", "Donor season", "Every party receives an extra 150K in this round's income."),
         "underdog":   ("🤲", "Sympathy for the underdog", "The party with the fewest seats receives an extra 400K this round."),
+        "econ_crisis":     ("🏚️", "Economic crisis", "Voters want protection: left-leaning parties campaign 25% more effectively this round."),
+        "security_crisis": ("🚨", "Security crisis", "Voters want order: right-leaning parties campaign 25% more effectively this round."),
     }
     icon, title, text = cards[kind]
     return {"kind": kind, "icon": icon, "title": title, "text": text, **kw}
@@ -96,6 +103,12 @@ class Player:
     money: float = 0
     is_bot: bool = False
     trait: str = DEFAULT_TRAIT
+    platform: dict = field(default_factory=dict)   # issue -> "left" | "center" | "right"
+    credibility_until: int = 0                     # after repositioning, campaigns are weaker up to this round
+
+    def __post_init__(self):
+        if not self.platform:
+            self.platform = default_platform(self.left)
 
     @property
     def right(self) -> float:
@@ -187,14 +200,17 @@ class Game:
         self.sector_market = self._roll_market()
         self.event = event_card("opening")
         self.news: list[str] = []                       # diplomacy news, shown with the next round report
+        self.government: list[str] = []                 # bloc with the most seats after the last election
+        self.cabinets: dict[frozenset, dict] = {}       # coalition -> agreed {ministry: pid}
+        self.cabinet_proposals: dict[frozenset, dict] = {}  # coalition -> {"by", "alloc", "accepted"}
         for p in self.players.values():
             p.money = self.rules.start_money
 
     # ---------- events ----------
     def _draw_event(self) -> dict:
         kinds = ["boom", "crash", "scandal", "debate", "disaster", "apathy", "wave_left", "wave_right",
-                 "donors", "underdog", "calm"]
-        weights = [10, 8, 9, 9, 8, 7, 6, 6, 7, 7, 6]
+                 "donors", "underdog", "calm", "econ_crisis", "security_crisis"]
+        weights = [10, 8, 9, 9, 8, 7, 6, 6, 7, 7, 6, 6, 6]
         kind = self.rng.choices(kinds, weights)[0]
         if kind in ("boom", "crash"):
             return event_card(kind, sector=self.rng.choice(SECTORS))
@@ -231,6 +247,80 @@ class Game:
         base = self.regions[rid]["seats"] * self.rules.independent_support_per_seat
         return base * (1.5 if self._ev("apathy") else 1.0)
 
+    def campaign_mult(self, pid: str, rid: str, kind: str = "rally") -> float:
+        """Everything that scales a party's campaigning in a region (traits like Orator/Media are applied
+        per action type in resolve)."""
+        p, r = self.players[pid], self.regions[rid]
+        m = self.effective_multiplier(pid, rid) * platform_mult(p.platform, p.left, r["sector"], r["right"])
+        if p.credibility_until >= self.round:
+            m *= self.rules.credibility_penalty
+        if (self._ev("econ_crisis") and p.left >= 55) or (self._ev("security_crisis") and p.left <= 45):
+            m *= 1.25
+        if self.holds(pid, "foreign"):
+            m *= 1.1
+        if kind == "rally":
+            lean = leaning(r["right"])
+            if self.holds(pid, "agriculture") and r["sector"] == "agriculture":
+                m *= 1.15
+            if (self.holds(pid, "interior") and lean == "right") or (self.holds(pid, "social") and lean == "left"):
+                m *= 1.2
+        return m
+
+    # ---------- government & ministries ----------
+    def ministry_holder(self, ministry: str) -> str | None:
+        if not self.government:
+            return None
+        if len(self.government) == 1:
+            return self.government[0]          # single-party government holds every ministry
+        return self.cabinets.get(frozenset(self.government), {}).get(ministry)
+
+    def holds(self, pid: str, ministry: str) -> bool:
+        return self.ministry_holder(ministry) == pid
+
+    def _form_government(self, totals: dict) -> None:
+        blocs = [sorted(c) for c in self.coalitions] + [[p] for p in self.players if not self.partners(p)]
+        scored = sorted(((sum(totals.get(p, 0) for p in b), b) for b in blocs), key=lambda x: -x[0])
+        new = scored[0][1] if scored and scored[0][0] > 0 and (len(scored) < 2 or scored[0][0] > scored[1][0]) else []
+        if new != self.government and new:
+            self.news.append(f"🏛️ New government: {' + '.join(self.players[p].party for p in new)}")
+        self.government = new
+
+    def propose_cabinet(self, pid: str, alloc: dict) -> None:
+        group = self.coalition_of(pid)
+        if len(group) < 2:
+            raise ActionError("only coalitions negotiate ministries")
+        if not isinstance(alloc, dict) or set(alloc) != set(MINISTRIES) or not set(alloc.values()) <= group:
+            raise ActionError("assign every ministry to a coalition member")
+        key = frozenset(group)
+        self.cabinet_proposals[key] = {"by": pid, "alloc": dict(alloc), "accepted": {pid}}
+        self._check_cabinet(key)
+
+    def answer_cabinet(self, pid: str, accept: bool) -> None:
+        key = frozenset(self.coalition_of(pid))
+        prop = self.cabinet_proposals.get(key)
+        if not prop:
+            raise ActionError("no ministry proposal to answer")
+        if accept:
+            prop["accepted"].add(pid)
+            self._check_cabinet(key)
+        else:
+            del self.cabinet_proposals[key]
+            self.news.append(f"❌ {self.players[pid].party} rejected the ministry deal")
+
+    def _check_cabinet(self, key: frozenset) -> None:
+        prop = self.cabinet_proposals[key]
+        if prop["accepted"] >= key:
+            self.cabinets[key] = prop["alloc"]
+            del self.cabinet_proposals[key]
+            self.news.append(f"📜 {' + '.join(self.players[p].party for p in sorted(key))} agreed how to share the ministries")
+
+    def _prune_cabinets(self) -> None:
+        live = {frozenset(c) for c in self.coalitions}
+        self.cabinets = {k: v for k, v in self.cabinets.items() if k in live}
+        self.cabinet_proposals = {k: v for k, v in self.cabinet_proposals.items() if k in live}
+        if self.government and len(self.government) > 1 and frozenset(self.government) not in live:
+            self.government = []   # the governing coalition broke up: caretaker period until the next election
+
     # ---------- coalitions ----------
     def coalition_of(self, pid: str) -> set[str]:
         return next((c for c in self.coalitions if pid in c), {pid})
@@ -260,6 +350,7 @@ class Game:
         self.proposals.discard((b, a))
         merged = self.coalition_of(a) | self.coalition_of(b)
         self.coalitions = [c for c in self.coalitions if not (c & merged)] + [merged]
+        self._prune_cabinets()
         self.news.append(f"🤝 {' + '.join(self.players[p].party for p in sorted(merged))} formed a coalition")
 
     def leave_coalition(self, a: str) -> None:
@@ -268,6 +359,7 @@ class Game:
             raise ActionError("not in a coalition")
         rest = group - {a}
         self.coalitions = [c for c in self.coalitions if c is not group] + ([rest] if len(rest) > 1 else [])
+        self._prune_cabinets()
         self.news.append(f"💔 {self.players[a].party} left its coalition")
 
     # ---------- planning ----------
@@ -295,6 +387,13 @@ class Game:
                 c["region"] = self._region(a.get("region"))
             elif t == "invest_sector":
                 c["sector"] = self._sector(a.get("sector"))
+            elif t == "reposition":
+                if a.get("direction") not in ("left", "right"):
+                    raise ActionError("reposition left or right")
+                if any(x["type"] == "reposition" for x in clean):
+                    raise ActionError("you can only reposition once per round")
+                c["direction"] = a["direction"]
+                c["amount"] = amount = self.rules.reposition_cost
             elif t == "transfer":
                 target = a.get("target")
                 if target not in self.players or target == pid:
@@ -340,9 +439,9 @@ class Game:
         return all(p in self.pending for p in pids)
 
     # ---------- resolution ----------
-    def _add_support(self, rid: str, pid: str, amount: float) -> None:
+    def _add_support(self, rid: str, pid: str, amount: float, kind: str = "rally") -> None:
         s = self.support[rid]
-        s[pid] = s.get(pid, 0) + amount * self.effective_multiplier(pid, rid)
+        s[pid] = s.get(pid, 0) + amount * self.campaign_mult(pid, rid, kind)
 
     def resolve(self) -> dict:
         if self.finished:
@@ -356,6 +455,15 @@ class Game:
             for sup in self.support.values():
                 if self.event["party"] in sup:
                     sup[self.event["party"]] *= 0.75
+        # 0. repositioning: the party moves, voters are wary for a while
+        for pid, actions in self.pending.items():
+            for a in actions:
+                if a["type"] == "reposition" and a["amount"] <= self.players[pid].money:
+                    p = self.players[pid]
+                    step = self.rules.reposition_step
+                    p.left = max(0, min(100, p.left + (step if a["direction"] == "left" else -step)))
+                    p.credibility_until = self.round + 1
+                    events.append(f"🧭 {p.party} repositioned to {p.left}% left / {100 - p.left}% right")
         # 1. spending
         for pid, actions in self.pending.items():
             p = self.players[pid]
@@ -369,6 +477,8 @@ class Game:
                 if t == "rally":
                     boost = (1.25 if tr == "orator" else 1.0) * (1.5 if self._ev("disaster") and a["region"] == self.event["region"] else 1.0)
                     self._add_support(a["region"], pid, amt * boost)
+                elif t == "reposition":
+                    pass  # applied above
                 elif t == "transfer":
                     self.players[a["target"]].money += amt
                     events.append(f"💸 {p.party} sent money to {self.players[a['target']].party}")
@@ -379,21 +489,22 @@ class Game:
                     inv = self.sector_invest[a["sector"]]
                     inv[pid] = inv.get(pid, 0) + amt
                 elif a["kind"] == "tv":
-                    eff = self.rules.tv_efficiency * ad_boost * (1.3 if tr == "media" else 1.0)
+                    eff = self.rules.tv_efficiency * ad_boost * (1.3 if tr == "media" else 1.0) * (1.25 if self.holds(pid, "media") else 1.0)
                     for rid, r in self.regions.items():
-                        self._add_support(rid, pid, amt * eff * r["seats"] / total_seats)
+                        self._add_support(rid, pid, amt * eff * r["seats"] / total_seats, "ad")
                     events.append(f"{p.party} ran a national TV ad campaign")
                 elif a["kind"] == "social":
                     rs = [r for r in self.regions.values() if r["sector"] == a["sector"]]
                     seats = sum(r["seats"] for r in rs) or 1
-                    eff = self.rules.social_efficiency * ad_boost * (1.3 if tr == "media" else 1.0)
+                    eff = self.rules.social_efficiency * ad_boost * (1.3 if tr == "media" else 1.0) * (1.25 if self.holds(pid, "media") else 1.0)
                     for r in rs:
-                        self._add_support(r["id"], pid, amt * eff * r["seats"] / seats)
+                        self._add_support(r["id"], pid, amt * eff * r["seats"] / seats, "ad")
                     events.append(f"{p.party} targeted {a['sector']} regions with social media ads")
                 else:  # negative
                     s = self.support[a["region"]]
                     tgt = a["target"]
-                    s[tgt] = max(0.0, s.get(tgt, 0) - amt * self.rules.negative_efficiency)
+                    hit = amt * self.rules.negative_efficiency * (0.5 if self.holds(tgt, "interior") else 1.0)
+                    s[tgt] = max(0.0, s.get(tgt, 0) - hit)
                     events.append(f"{p.party} attacked {self.players[tgt].party} in {self.regions[a['region']]['name']}")
         self.pending = {}
 
@@ -413,10 +524,14 @@ class Game:
                 flips.append(rid)
         seat_totals = self.seat_totals()
         self.seat_history.append(seat_totals)
+        self._form_government(seat_totals)
+        events += self.news
+        self.news = []
 
         # 3. income
         income = {pid: {"base": self.rules.base_income * (1.6 if p.trait == "fundraiser" else 1.0),
-                        "leadership": 0.0, "penalty": 0.0, "regions": 0.0, "sectors": 0.0, "event": 0.0}
+                        "leadership": 0.0, "penalty": 0.0, "regions": 0.0, "sectors": 0.0, "event": 0.0,
+                        "ministries": (100_000 if self.holds(pid, "finance") else 0) + (50_000 if self.holds(pid, "social") else 0)}
                   for pid, p in self.players.items()}
         for rid, leader in self.leaders.items():
             if leader:
@@ -452,6 +567,8 @@ class Game:
                 pool *= 1.6 if self._ev("boom") else 0.5
             for pid, amt in split_income(pool, self.sector_invest[s_], self.rules,
                                          self.rules.sector_saturation, self.sector_owner[s_]).items():
+                if any(self.holds(pid, m) and s_ in secs for m, secs in MINISTRY_SECTORS.items()):
+                    amt *= 1.3
                 income[pid]["sectors"] += amt
         for pid, inc in income.items():
             if self._trait(pid) == "tycoon":
@@ -470,10 +587,22 @@ class Game:
             self.players[pid].money = round(self.players[pid].money + inc["total"])
 
         # 4. decay + advance
-        for rid in self.regions:
+        for rid, r in self.regions.items():
             for pid in self.support[rid]:
-                decay = self.rules.support_decay / 2 if self._trait(pid) == "grassroots" else self.rules.support_decay
+                # loyal base: voters who share your ideology stay (0.5x decay), opponents drift away (up to 1.5x)
+                decay = self.rules.support_decay * (0.5 + abs(self.players[pid].right - r["right"]))
+                if self._trait(pid) == "grassroots":
+                    decay /= 2
                 self.support[rid][pid] *= 1 - decay
+        for c in self.coalitions:
+            t = coalition_tension([self.players[p].left for p in c])
+            if t > 0:
+                for sup in self.support.values():
+                    for p in c:
+                        if p in sup:
+                            sup[p] *= 1 - t
+                events.append(f"😠 Coalition tension: {' + '.join(self.players[p].party for p in sorted(c))} "
+                              f"each lost {round(t * 100)}% support (their voters dislike the ideological gap)")
         for rid in flips:
             events.append(f"{self.players[self.leaders[rid]].party} now leads {self.regions[rid]['name']}")
         report = {"round": self.round, "seats": seat_totals, "income": income, "events": events,
@@ -553,8 +682,19 @@ class Game:
             "coalitions": [sorted(c) for c in self.coalitions],
             "proposals": sorted(self.proposals),
             "traits": {pid: p.trait for pid, p in self.players.items()},
+            "ideology": {pid: p.left for pid, p in self.players.items()},
+            "platforms": {pid: p.platform for pid, p in self.players.items()},
+            "credibility": {pid: p.credibility_until for pid, p in self.players.items()},
+            "government": self.government,
+            "ministries": {m: self.ministry_holder(m) for m in MINISTRIES},
+            "cabinets": [{"members": sorted(k), "alloc": v} for k, v in self.cabinets.items()],
+            "cabinet_proposals": [{"members": sorted(k), "by": v["by"], "alloc": v["alloc"], "accepted": sorted(v["accepted"])}
+                                  for k, v in self.cabinet_proposals.items()],
+            "tension": [{"members": sorted(c), "loss": round(coalition_tension([self.players[p].left for p in c]), 3)}
+                        for c in self.coalitions],
             "rules": {k: getattr(self.rules, k) for k in (
                 "min_action", "dominance_ratio", "dominance_share", "leader_bonus_per_seat", "mismatch_grace",
                 "mismatch_penalty_slope", "mismatch_penalty_cap", "tv_efficiency", "social_efficiency",
-                "negative_efficiency", "support_decay", "control_min_pools")},
+                "negative_efficiency", "support_decay", "control_min_pools", "reposition_step", "reposition_cost",
+                "credibility_penalty")},
         }

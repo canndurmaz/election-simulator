@@ -5,7 +5,7 @@ REST:  GET  /api/maps, GET /api/maps/{id}, GET /api/rooms
        POST /api/rooms/{code}/join {player_name}
        -> {code, player_id, token}
 WS:    /ws/{code}?token=...   client -> {"t": "profile"|"ready"|"start"|"add_bot"|"kick"|"leave"|"submit"|"unsubmit"|"next"|"chat"|
-                                        "propose"|"respond"|"leave_coalition", ...}
+                                        "propose"|"respond"|"leave_coalition"|"cabinet_propose"|"cabinet_answer", ...}
                               server -> {"t": "state", room, game, you} | {"t": "error", msg}
 """
 import asyncio
@@ -184,6 +184,12 @@ async def handle(room, me, msg: dict) -> bool:
         if not room.game:
             raise RoomError("no game running")
         room.game.leave_coalition(me.id)
+    elif t == "cabinet_propose":
+        room.propose_cabinet(me.id, msg.get("alloc"))
+    elif t == "cabinet_answer":
+        if not room.game:
+            raise RoomError("no game running")
+        room.game.answer_cabinet(me.id, bool(msg.get("accept")))
     elif t == "chat":
         text = str(msg.get("text", "")).strip()[:300]
         if text:

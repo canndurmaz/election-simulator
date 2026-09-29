@@ -59,3 +59,27 @@ def test_traits_and_bot_levels_in_room_state():
     assert [x for x in st["members"] if x["id"] == bot.id][0]["bot_level"] == "hard"
     with pytest.raises(RoomError):
         room.set_profile(m.id, {"trait": "wizard"})
+
+
+def test_bots_negotiate_ministries_in_coalition():
+    room, a, b = setup_room()
+    bot = next(m for m in room.members.values() if m.is_bot)
+    room.game.propose(bot.id, a.id)
+    room.game.respond(a.id, bot.id, True)
+    room.submit(a.id, []); room.submit(b.id, [])
+    room.ack_results(a.id); room.ack_results(b.id)          # next planning phase: bot tables a deal
+    prop = room.game.cabinet_proposals[frozenset({a.id, bot.id})]
+    assert set(prop["alloc"].values()) <= {a.id, bot.id} and bot.id in prop["accepted"]
+    room.game.answer_cabinet(a.id, True)
+    assert frozenset({a.id, bot.id}) in room.game.cabinets
+    assert "my_mult" in room.game_state_for(a.id)
+
+
+def test_platform_profile_validation():
+    mgr = RoomManager()
+    room = mgr.create("t", "usa", 4, 60, 3, False)
+    m = room.add_member("A")
+    room.set_profile(m.id, {"platform": {"economy": "left", "society": "right"}})
+    assert m.platform["economy"] == "left" and m.platform["environment"] == "center"
+    with pytest.raises(RoomError):
+        room.set_profile(m.id, {"platform": {"economy": "sideways"}})

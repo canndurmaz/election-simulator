@@ -29,6 +29,11 @@ mobileMq.addEventListener('change', () => {
 const TAB_ICON = { map: '🗺️', region: '📍', campaign: '📣', economy: '🏭', plan: '📝', diplomacy: '🤝', standings: '🏆', report: '📰', chat: '💬' };
 
 // ---------- utils ----------
+function stanceText(opt) {
+  const parts = Object.entries(opt.sectors || {}).map(([sec, v]) => `${v > 0 ? '+' : ''}${Math.round(v * 100)}% in ${sec} regions`);
+  if (opt.lean) parts.push(`+12% with ${opt.lean}-leaning voters, −8% with the other side`);
+  return parts.join(', ');
+}
 function toast(msg, info = false) {
   const d = document.createElement('div');
   d.textContent = msg; if (info) d.className = 'info';
@@ -53,7 +58,8 @@ const player = id => S.room?.members.find(m => m.id === id);
 const partyName = id => id === IND ? 'Independents' : (player(id)?.party ?? '?');
 const partyColor = id => id === IND ? IND_COLOR : (player(id)?.color ?? '#666');
 const me = () => player(S.you);
-const myRight = () => (100 - (me()?.left ?? 50)) / 100;
+const partyLeft = id => S.game?.ideology?.[id] ?? player(id)?.left ?? 50;   // parties can reposition mid-game
+const myRight = () => (100 - partyLeft(S.you)) / 100;
 const region = id => S.map.regions.find(r => r.id === id);
 function mix(a, b, t) {
   const p = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
@@ -67,7 +73,7 @@ function effMult(pid, r) {
   const ev = S.game?.event?.kind;
   if (ev === 'wave_left') rr = Math.max(0, rr - 0.15);
   if (ev === 'wave_right') rr = Math.min(1, rr + 0.15);
-  const m = ideoMult((100 - (player(pid)?.left ?? 50)) / 100, rr);
+  const m = ideoMult((100 - partyLeft(pid)) / 100, rr);
   return S.game?.traits?.[pid] === 'populist' ? Math.max(m, 0.8) : m;
 }
 const traitOf = id => S.room?.traits?.[S.game?.traits?.[id] ?? player(id)?.trait];
@@ -271,6 +277,14 @@ function renderLobby() {
         <input type="range" id="left" min="0" max="100" step="5" value="${mine.left}" style="direction:rtl">
         <div class="between muted" style="font-size:12px"><span>◀ Right</span><span>Left ▶</span></div>
         <p class="muted" style="font-size:12px">Campaigns work best where voters match your ideology. Winning a region that doesn't match costs you part of its leadership income.</p>
+        <label>Policy platform <span class="muted">— wins or loses voters by sector and leaning</span></label>
+        <div class="platform">${Object.entries(r.issues).map(([k, iss]) => {
+          const cur = (mine.platform || {})[k] || 'center';
+          const warn = side => (side === 'right' && mine.left >= 60) || (side === 'left' && mine.left <= 40);
+          return `<div class="issue"><span class="iname">${iss.icon} ${esc(iss.name)}</span>
+            <span class="seg3">${['left', 'center', 'right'].map(side => `<button class="small ${cur === side ? 'on' : ''}" data-stance="${k}:${side}"
+              title="${side === 'center' ? 'No effect' : esc(stanceText(iss[side]))}${side !== 'center' && warn(side) ? ' — against your ideology: only half as convincing' : ''}">${side === 'center' ? 'Neutral' : esc(iss[side].label)}${side !== 'center' && warn(side) ? ' ½' : ''}</button>`).join('')}</span></div>`;
+        }).join('')}</div>
         <label>Party leader's strength</label>
         <div class="traits">${Object.entries(r.traits).map(([k, t]) => `<button class="trait ${k === mine.trait ? 'sel' : ''}" data-trait="${k}"><b>${t.icon} ${esc(t.name)}</b><span>${esc(t.text)}</span></button>`).join('')}</div>
         <button class="${mine.ready ? '' : 'primary'}" id="ready" style="width:100%">${mine.ready ? 'Not ready' : "I'm ready"}</button>
@@ -283,6 +297,10 @@ function renderLobby() {
   $('#party').onkeydown = e => e.key === 'Enter' && send({ t: 'profile', party: $('#party').value });
   document.querySelectorAll('[data-color]').forEach(b => b.onclick = () => send({ t: 'profile', color: b.dataset.color }));
   document.querySelectorAll('[data-trait]').forEach(b => b.onclick = () => send({ t: 'profile', trait: b.dataset.trait }));
+  document.querySelectorAll('[data-stance]').forEach(b => b.onclick = () => {
+    const [issue, side] = b.dataset.stance.split(':');
+    send({ t: 'profile', platform: { ...(mine.platform || {}), [issue]: side } });
+  });
   $('#left').oninput = e => { const l = +e.target.value; $('#ideolabel').textContent = `${l}% left / ${100 - l}% right`; };
   $('#left').onchange = e => send({ t: 'profile', left: +e.target.value });
   $('#ready').onclick = () => send({ t: 'ready', ready: !mine.ready });
@@ -354,6 +372,7 @@ function describe(a) {
     case 'rally': return `📣 Rally in ${rn(a.region)}`;
     case 'invest_region': return `🏗️ Invest in ${rn(a.region)}`;
     case 'invest_sector': return `${SECTOR_ICON[a.sector]} Invest in ${a.sector}`;
+    case 'reposition': return `🧭 Shift ${S.game.rules.reposition_step} points ${a.direction}`;
     case 'transfer': return `💸 Send money to ${esc(partyName(a.target))}`;
     case 'ad': return a.kind === 'tv' ? '📺 National TV ad' : a.kind === 'social' ? `📱 Social ads → ${a.sector}` : `🗯️ Attack ad vs ${esc(partyName(a.target))} in ${rn(a.region)}`;
   }
@@ -418,7 +437,7 @@ function scoreboard() {
   const g = S.game;
   return g.standings.map((s, i) => `<div class="sb-row ${s.id === S.you ? 'me' : ''}">
     <span class="sb-rank">${i + 1}</span><span class="dot" style="background:${partyColor(s.id)}"></span>
-    <span class="sb-name">${traitIcon(s.id)} ${esc(partyName(s.id))}${partnersOf(s.id).length ? ' <span title="in a coalition">🤝</span>' : ''}</span>
+    <span class="sb-name">${traitIcon(s.id)} ${esc(partyName(s.id))}${partnersOf(s.id).length ? ' <span title="in a coalition">🤝</span>' : ''}${g.government.includes(s.id) ? ' <span title="in government">🏛️</span>' : ''}</span>
     <span class="sb-seats"><b>${s.seats}</b> ${deltaHtml(seatDelta(s.id))}</span>
     <span class="sb-money">${money(s.money)}</span>
     <span class="sb-status">${S.room.phase === 'planning' ? (g.submitted.includes(s.id) ? '✓' : '…') : ''}</span></div>`).join('');
@@ -482,7 +501,8 @@ function renderGame() {
   const ev = g.event;
   $('#eventcard').innerHTML = `<span class="ev-icon">${ev.icon}</span><div><b>Round ${g.round}: ${esc(ev.title)}</b><div>${esc(ev.text)}</div></div>`;
   $('#eventcard').onclick = () => $('#eventcard').classList.toggle('open');
-  const incoming = g.proposals.filter(([, to]) => to === S.you).length;
+  const incoming = g.proposals.filter(([, to]) => to === S.you).length
+    + g.cabinet_proposals.filter(c => c.members.includes(S.you) && !c.accepted.includes(S.you)).length;
   const tabs = { ...(isMobile() ? { map: 'Map' } : {}), region: RL(), campaign: isMobile() ? 'Ads' : 'Campaign', economy: 'Economy',
     plan: `Plan${S.plan.length ? ` (${S.plan.length})` : ''}`, diplomacy: `Diplomacy${incoming ? ` (${incoming}!)` : ''}`,
     standings: 'Standings', report: isMobile() ? 'News' : 'Report', chat: 'Chat' };
@@ -512,7 +532,7 @@ function regionPanel() {
   const inv = Object.entries(g.invest).sort((a, b) => b[1] - a[1]);
   const itotal = inv.reduce((s, [, v]) => s + v, 0);
   const ctl = control(g.invest, g.owner, g.pool);
-  const mult = effMult(S.you, r), pen = mismatch(myRight(), r.right) * (S.game.traits[S.you] === 'populist' ? 0.5 : 1);
+  const mult = S.game.my_mult?.[r.id] ?? effMult(S.you, r), pen = mismatch(myRight(), r.right) * (S.game.traits[S.you] === 'populist' ? 0.5 : 1);
   const bonus = r.seats * S.game.rules.leader_bonus_per_seat;
   const opponents = S.game.standings.filter(s => s.id !== S.you && !partnersOf(S.you).includes(s.id));
   if (!opponents.some(o => o.id === S.negTarget)) S.negTarget = opponents[0]?.id;
@@ -541,7 +561,30 @@ function campaignPanel() {
     <div class="action"><div class="title">📱 Social media ads</div><div class="desc">Targets every ${RL().toLowerCase()} of one sector — more efficient than TV.</div>
       <div class="chips" style="margin-bottom:6px">${SECTORS.map(s => `<button class="chip ${s === S.socialSector ? 'on' : ''}" data-social="${s}">${SECTOR_ICON[s]} ${s}</button>`).join('')}</div>
       ${spender({ type: 'ad', kind: 'social', sector: S.socialSector })}</div>
-    <p class="muted" style="font-size:12px">Rallies and attack ads: click a ${RL().toLowerCase()} on the map.</p>`;
+    <p class="muted" style="font-size:12px">Rallies and attack ads: click a ${RL().toLowerCase()} on the map.</p>
+    ${ideologyPanel()}`;
+}
+
+function ideologyPanel() {
+  const g = S.game, R = g.rules, left = partyLeft(S.you), plat = g.platforms[S.you] || {};
+  const planned = S.plan.find(a => a.type === 'reposition');
+  const doubting = g.credibility[S.you] >= g.round;
+  const issues = S.room.issues;
+  return `<h2 style="margin-top:18px">🧭 Ideology</h2>
+    <div class="action">${ideoBar(left)}
+      <div class="desc" style="margin-top:8px">Voters who share your ideology stay loyal (their support fades half as fast); the others drift away faster.</div>
+      <div class="title" style="margin-top:6px">Your platform</div>
+      ${Object.entries(issues).map(([k, iss]) => {
+        const side = plat[k] || 'center';
+        return `<div style="font-size:13px">${iss.icon} ${esc(iss.name)}: <b>${side === 'center' ? 'Neutral' : esc(iss[side].label)}</b>${side !== 'center' ? ` <span class="muted">(${esc(stanceText(iss[side]))})</span>` : ''}</div>`;
+      }).join('')}
+    </div>
+    <div class="action"><div class="title">Reposition the party</div>
+      <div class="desc">Move ${R.reposition_step} points left or right for ${money(R.reposition_cost)}. Voters are wary of a flip-flop: your campaigns are ${pct(1 - R.credibility_penalty)} weaker this round and next.</div>
+      ${doubting ? `<div class="bad" style="font-size:12px;margin-bottom:6px">Voters still doubt your last repositioning (until round ${g.credibility[S.you]}).</div>` : ''}
+      ${planned ? `<div class="between"><span>Planned: shift <b>${planned.direction}</b> → ${left + (planned.direction === 'left' ? R.reposition_step : -R.reposition_step)}% left</span><button class="small danger" data-unrepos>✕</button></div>`
+        : `<div class="row"><button data-repos="left" ${left >= 100 || !canEdit() ? 'disabled' : ''}>◀ Shift left</button><button data-repos="right" ${left <= 0 || !canEdit() ? 'disabled' : ''}>Shift right ▶</button></div>`}
+    </div>`;
 }
 
 function economyPanel() {
@@ -563,7 +606,7 @@ function economyPanel() {
 
 function planPanel() {
   return `<h2>This round's plan</h2>
-    ${S.plan.length ? S.plan.map(a => `<div class="plan-block"><div class="between"><span>${describe(a)}</span></div>${spender({ ...a, amount: undefined })}</div>`).join('')
+    ${S.plan.length ? S.plan.map(a => `<div class="plan-block"><div class="between"><span>${describe(a)}</span>${a.type === 'reposition' ? `<span>${money(a.amount)} ${canEdit() ? '<button class="small danger" data-unrepos>✕</button>' : ''}</span>` : ''}</div>${a.type === 'reposition' ? '' : spender({ ...a, amount: undefined })}</div>`).join('')
       + `<div class="plan-item"><b>Total</b><b>${money(planTotal())}</b></div>` : '<p class="muted">Nothing planned yet. Unspent funds carry over to the next round.</p>'}`;
 }
 
@@ -601,16 +644,19 @@ function diplomacyPanel() {
   const outgoing = g.proposals.filter(([from]) => from === S.you).map(([, to]) => to);
   const others = g.standings.filter(s => s.id !== S.you && !mine.includes(s.id));
   return `<h2>Diplomacy</h2>
+    ${governmentHtml()}
     <p class="muted" style="font-size:12px">A coalition that holds a <b>majority (${majority} ${esc(S.map.seat_label)})</b> at the end of the game wins together. Partners can't run attack ads against each other. Anyone can leave a coalition at any time.</p>
     ${incoming.length ? `<h3>Offers to you</h3>${incoming.map(id => `<div class="action between"><span>🤝 <b style="color:${partyColor(id)}">${esc(partyName(id))}</b> invites you into a coalition</span>
       <span class="row auto"><button class="small primary" data-accept="${id}">Accept</button><button class="small" data-decline="${id}">Decline</button></span></div>`).join('')}` : ''}
     <h3>Your coalition</h3>
     ${mine.length ? `<div class="action"><div>${group.map(id => `<span class="dot" style="background:${partyColor(id)};width:9px;height:9px"></span> ${esc(partyName(id))} (${totals[id] || 0})`).join(' + ')}</div>
       <div class="between" style="margin-top:6px"><span>${groupSeats}/${majority} for a majority ${groupSeats >= majority ? '<span class="good">✓ majority!</span>' : ''}</span><button class="small danger" id="leavecoal">Leave coalition</button></div>
-      <div class="ideo-bar" style="margin-top:6px"><div style="width:${Math.min(100, 100 * groupSeats / majority)}%;background:var(--good)"></div></div></div>`
-      : '<p class="muted">You are governing alone for now.</p>'}
+      <div class="ideo-bar" style="margin-top:6px"><div style="width:${Math.min(100, 100 * groupSeats / majority)}%;background:var(--good)"></div></div>
+      ${tensionHtml(group)}</div>
+      ${cabinetHtml(group)}`
+      : '<p class="muted">You are on your own for now.</p>'}
     <h3>Other parties</h3>
-    ${others.map(s => `<div class="action between"><span><span class="dot" style="background:${partyColor(s.id)};width:9px;height:9px"></span> ${traitIcon(s.id)} <b>${esc(partyName(s.id))}</b> · ${s.seats} · ${player(s.id)?.left ?? '?'}% left${partnersOf(s.id).length ? ' · 🤝 in a coalition' : ''}</span>
+    ${others.map(s => `<div class="action between"><span><span class="dot" style="background:${partyColor(s.id)};width:9px;height:9px"></span> ${traitIcon(s.id)} <b>${esc(partyName(s.id))}</b> · ${s.seats} · ${partyLeft(s.id)}% left${partnersOf(s.id).length ? ' · 🤝 in a coalition' : ''}</span>
       ${outgoing.includes(s.id) ? '<span class="muted">offer sent…</span>' : `<button class="small" data-propose="${s.id}">Propose coalition</button>`}</div>`).join('') || '<p class="muted">Everyone is already in your coalition.</p>'}
     <h3>💸 Send money</h3>
     <p class="muted" style="font-size:12px">Pay another party — to seal a deal, support a partner or buy a favour. Arrives when the round resolves. Agree terms in Chat.</p>
@@ -618,10 +664,68 @@ function diplomacyPanel() {
     ${S.transferTo ? spender({ type: 'transfer', target: S.transferTo }) : '<p class="muted" style="font-size:12px">Pick a party first.</p>'}`;
 }
 
+function governmentHtml() {
+  const g = S.game, M = S.room.ministries;
+  const gov = g.government;
+  const govSeats = gov.reduce((t, id) => t + (g.standings.find(s => s.id === id)?.seats || 0), 0);
+  return `<h3>🏛️ Government</h3>
+    <p class="muted" style="font-size:12px">After every election the largest bloc governs and holds the ministries. A single party holds them all; a coalition must agree how to share them.</p>
+    ${gov.length ? `<div style="margin-bottom:6px">${gov.map(id => `<b style="color:${partyColor(id)}">${esc(partyName(id))}</b>`).join(' + ')} <span class="muted">· ${govSeats} ${esc(S.map.seat_label)}</span></div>`
+      : '<div class="muted" style="margin-bottom:6px">No government yet (caretaker period).</div>'}
+    <div class="ministries">${Object.entries(M).map(([k, m]) => {
+      const h = g.ministries[k];
+      return `<div class="ministry" title="${esc(m.text)}"><span>${m.icon} ${esc(m.name)}</span>
+        <span>${h ? `<span class="dot" style="background:${partyColor(h)};width:9px;height:9px"></span> ${esc(partyName(h))}` : '<span class="muted">vacant</span>'}</span>
+        <small class="muted">${esc(m.text)}</small></div>`;
+    }).join('')}</div>
+    ${gov.length > 1 && !Object.values(g.ministries).some(Boolean) ? '<p class="bad" style="font-size:12px">The governing coalition has no ministry deal yet, so nobody gets the ministry bonuses.</p>' : ''}`;
+}
+
+function tensionHtml(group) {
+  const t = S.game.tension.find(x => x.members.includes(S.you));
+  const lefts = group.map(partyLeft), gap = Math.max(...lefts) - Math.min(...lefts);
+  return `<div style="font-size:12px;margin-top:8px">Ideological gap: <b>${gap} points</b> ${t && t.loss > 0
+    ? `<span class="bad">— every partner loses ${Math.round(t.loss * 100)}% of its support each round (voters dislike the deal)</span>`
+    : '<span class="good">— compatible partners, no tension</span>'}</div>`;
+}
+
+function cabinetHtml(group) {
+  const g = S.game, M = S.room.ministries;
+  const key = [...group].sort().join();
+  const agreed = g.cabinets.find(c => c.members.join() === key);
+  const prop = g.cabinet_proposals.find(c => c.members.join() === key);
+  // the editor starts from the pending proposal, else the agreed deal, else a seat-proportional suggestion
+  S.cabinetDraft = S.cabinetDraft && S.cabinetDraft.key === key ? S.cabinetDraft : { key, alloc: { ...(prop?.alloc || agreed?.alloc || suggestCabinet(group)) } };
+  const draft = S.cabinetDraft.alloc;
+  const count = alloc => group.map(id => `${esc(partyName(id))} ${Object.values(alloc).filter(x => x === id).length}`).join(' · ');
+  return `<h3>🤝 Ministry negotiation</h3>
+    ${agreed ? `<div class="action"><div class="title">Current deal</div><div style="font-size:12px">${count(agreed.alloc)}</div></div>` : '<p class="muted" style="font-size:12px">No deal yet. Propose how to share the ministries; every partner must accept.</p>'}
+    ${prop ? `<div class="action"><div class="title">Proposal by ${esc(partyName(prop.by))}</div>
+      ${Object.entries(prop.alloc).map(([m, id]) => `<div class="between" style="font-size:13px"><span>${M[m].icon} ${esc(M[m].name)}</span><span style="color:${partyColor(id)}">${esc(partyName(id))}</span></div>`).join('')}
+      <div class="muted" style="font-size:12px;margin-top:6px">${count(prop.alloc)} · accepted by ${prop.accepted.map(id => esc(partyName(id))).join(', ')}</div>
+      ${prop.accepted.includes(S.you) ? '<div class="good" style="font-size:12px">✓ You accepted. Waiting for the others.</div>'
+        : '<div class="row" style="margin-top:6px"><button class="primary" data-cab="yes">Accept deal</button><button data-cab="no">Reject</button></div>'}</div>` : ''}
+    <div class="action"><div class="title">${prop ? 'Counter-proposal' : 'Propose a split'}</div>
+      ${Object.entries(M).map(([m, info]) => `<div class="between" style="font-size:13px;margin:3px 0"><span title="${esc(info.text)}">${info.icon} ${esc(info.name)}</span>
+        <select data-cabm="${m}" style="width:auto;padding:4px 6px">${group.map(id => `<option value="${id}" ${draft[m] === id ? 'selected' : ''}>${esc(partyName(id))}</option>`).join('')}</select></div>`).join('')}
+      <div class="between" style="margin-top:6px"><span class="muted" style="font-size:12px">${count(draft)}</span><button class="primary" data-cab="propose">Propose</button></div></div>`;
+}
+
+function suggestCabinet(group) {
+  // seat-proportional (D'Hondt) split, in ministry order
+  const seats = Object.fromEntries(group.map(id => [id, (S.game.standings.find(s => s.id === id)?.seats || 0) + 1]));
+  const got = Object.fromEntries(group.map(id => [id, 0])), alloc = {};
+  for (const m of Object.keys(S.room.ministries)) {
+    const id = group.reduce((a, b) => seats[b] / (got[b] + 1) > seats[a] / (got[a] + 1) ? b : a);
+    alloc[m] = id; got[id]++;
+  }
+  return alloc;
+}
+
 function incomeHtml(inc) {
   return `<dl class="kv"><dt>Base</dt><dd>${money(inc.base)}</dd><dt>Leadership bonuses</dt><dd>${money(inc.leadership)}</dd>
     <dt>Ideology mismatch</dt><dd class="bad">${money(inc.penalty)}</dd><dt>${RL()} economies</dt><dd>${money(inc.regions)}</dd>
-    <dt>Sectors</dt><dd>${money(inc.sectors)}</dd>${inc.event ? `<dt>Event bonus</dt><dd class="good">${money(inc.event)}</dd>` : ''}<dt><b>Total</b></dt><dd><b class="good">${money(inc.total)}</b></dd></dl>`;
+    <dt>Sectors</dt><dd>${money(inc.sectors)}</dd>${inc.ministries ? `<dt>Ministries</dt><dd class="good">${money(inc.ministries)}</dd>` : ''}${inc.event ? `<dt>Event bonus</dt><dd class="good">${money(inc.event)}</dd>` : ''}<dt><b>Total</b></dt><dd><b class="good">${money(inc.total)}</b></dd></dl>`;
 }
 
 function reportPanel() {
@@ -640,6 +744,19 @@ function bindPanel() {
   p.querySelectorAll('[data-negtarget]').forEach(b => b.onclick = () => { S.negTarget = b.dataset.negtarget; renderGame(); });
   p.querySelectorAll('[data-social]').forEach(b => b.onclick = () => { S.socialSector = b.dataset.social; renderGame(); });
   p.querySelectorAll('[data-tab-go]').forEach(b => b.onclick = () => { S.tab = b.dataset.tabGo; renderGame(); });
+  p.querySelectorAll('[data-repos]').forEach(b => b.onclick = () => {
+    if (!canEdit()) return;
+    const cost = S.game.rules.reposition_cost;
+    if (cost > budget()) return toast('Not enough funds');
+    S.plan.push({ type: 'reposition', direction: b.dataset.repos, amount: cost }); renderGame();
+  });
+  p.querySelectorAll('[data-unrepos]').forEach(b => b.onclick = () => { S.plan = S.plan.filter(a => a.type !== 'reposition'); renderGame(); });
+  p.querySelectorAll('[data-cabm]').forEach(sel => sel.onchange = () => { S.cabinetDraft.alloc[sel.dataset.cabm] = sel.value; renderGame(); });
+  p.querySelectorAll('[data-cab]').forEach(b => b.onclick = () => {
+    const v = b.dataset.cab;
+    if (v === 'propose') send({ t: 'cabinet_propose', alloc: S.cabinetDraft.alloc });
+    else send({ t: 'cabinet_answer', accept: v === 'yes' });
+  });
   p.querySelectorAll('[data-propose]').forEach(b => b.onclick = () => send({ t: 'propose', target: b.dataset.propose }));
   p.querySelectorAll('[data-accept]').forEach(b => b.onclick = () => send({ t: 'respond', from: b.dataset.accept, accept: true }));
   p.querySelectorAll('[data-decline]').forEach(b => b.onclick = () => send({ t: 'respond', from: b.dataset.decline, accept: false }));
@@ -755,6 +872,7 @@ function tutorialSteps() {
     ['🗳️ Every round is an election', `When everyone ends their turn, every ${rl} votes. The party with the most support <b>leads</b> it, and ${esc(seats)} are shared by vote share. You must beat the grey <b>Independents</b> to win anything. Support fades 10% per round, so keep campaigning.`],
     ['💰 Earning money', `Each round you earn:<br>• a base income<br>• a <b>leadership bonus</b> for every ${rl} you lead<br>• income from <b>${rl} economies</b> and <b>sectors</b> (🌾🏭🚢🏖️💻) you invested in.<br><br>Be the first to invest <b>3× more than everyone else combined</b> in a ${rl} or sector and you <b>own it for the rest of the game</b>: 80% of its income every round, no matter what others do.`],
     ['🃏 Events, leaders & coalitions', `Each round starts with an <b>event card</b> (a sector boom, a scandal, a TV debate…) shown above the scoreboard, so plan around it.<br><br>Your party leader has a <b>strength</b> you picked in the lobby (hover the icons to see everyone's).<br><br>In <b>Diplomacy</b> you can form <b>coalitions</b>: if your coalition holds a majority at the end, you win together. You can also send money to seal deals.`],
+    ['🧭 Ideology & government', `Your <b>platform</b> (picked in the lobby) wins or loses voters in certain sectors and with left/right-leaning voters. Voters who share your ideology are <b>loyal</b>; you can <b>reposition</b> the party mid-game, but voters distrust flip-flops for a while.<br><br>After each election the largest bloc forms the <b>government</b> and holds 8 <b>ministries</b> with real bonuses. Coalitions must <b>negotiate</b> who gets which (Diplomacy tab) and ideologically distant partners suffer <b>coalition tension</b>.`],
     ['▶️ Results & next turn', `After each round you'll see the standings and your income. Every player clicks <b>Go to next turn</b> to continue. Good luck!`],
   ];
 }

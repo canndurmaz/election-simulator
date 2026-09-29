@@ -8,6 +8,7 @@ hard   - greedy seat-per-money optimiser: wins/defends the cheapest seats, uses 
 import random
 
 from .engine import SECTORS, Game, ideology_multiplier
+from .politics import ISSUES, MINISTRIES
 
 LEVELS = ["easy", "normal", "hard"]
 
@@ -108,7 +109,7 @@ def _smart(game: Game, pid: str, rng: random.Random, hard: bool) -> list[dict]:
         rivals = {k: v for k, v in sup.items() if k != pid and k not in partners}
         top_rival = max(rivals, key=rivals.get) if rivals else None
         threat = max([game.independent_support(rid)] + list(rivals.values()))
-        mult = game.effective_multiplier(pid, rid) * (1.25 if me.trait == "orator" else 1.0)
+        mult = game.campaign_mult(pid, rid) * (1.25 if me.trait == "orator" else 1.0)
         margin = 1.2 if hard else 1.1
         need = threat * margin - mine
         if need <= 0:
@@ -141,11 +142,11 @@ def _smart(game: Game, pid: str, rng: random.Random, hard: bool) -> list[dict]:
     # leftover: broad support where it fits best (social ads for media darlings, rallies otherwise)
     if camp >= lo * 3:
         if me.trait == "media":
-            best = max(SECTORS, key=lambda s: sum(game.effective_multiplier(pid, r["id"]) * r["seats"]
+            best = max(SECTORS, key=lambda s: sum(game.campaign_mult(pid, r["id"], "ad") * r["seats"]
                                                   for r in game.regions.values() if r["sector"] == s))
             actions.append({"type": "ad", "kind": "social", "sector": best, "amount": camp})
         else:
-            best = sorted(game.regions, key=lambda rid: game.regions[rid]["seats"] * game.effective_multiplier(pid, rid),
+            best = sorted(game.regions, key=lambda rid: game.regions[rid]["seats"] * game.campaign_mult(pid, rid),
                           reverse=True)[:3]
             for rid in best:
                 actions.append({"type": "rally", "region": rid, "amount": camp / 3})
@@ -172,3 +173,57 @@ def respond_to_coalition(game: Game, bot: str, proposer: str, level: str, rng: r
     mine = sum(totals.get(p, 0) for p in game.coalition_of(bot))
     theirs = sum(totals.get(p, 0) for p in game.coalition_of(proposer))
     return gap <= 40 and mine < majority and mine + theirs > mine * 1.3
+
+
+# ---------- ideology & government ----------
+def choose_platform(party_left: int, rng: random.Random) -> dict:
+    """Mostly stances that fit the party's ideology; centrists mix."""
+    side = "left" if party_left >= 60 else "right" if party_left <= 40 else None
+    return {issue: side if side and rng.random() < 0.8 else rng.choice(["left", "center", "right"]) for issue in ISSUES}
+
+
+def _preferences(game: Game, pid: str) -> list[str]:
+    p = game.players[pid]
+    order = ["finance", "economy", "foreign", "media", "trade", "agriculture", "social", "interior"]
+    ideological = "social" if p.left >= 55 else "interior" if p.left <= 45 else None
+    if ideological:
+        order.remove(ideological)
+        order.insert(1, ideological)
+    if p.trait == "media":
+        order.remove("media"); order.insert(0, "media")
+    if p.trait == "tycoon":
+        order.remove("economy"); order.insert(0, "economy")
+    return order
+
+
+def fair_shares(game: Game, members: list[str]) -> dict[str, float]:
+    totals = game.seat_totals()
+    weights = {p: totals.get(p, 0) + 1 for p in members}   # +1: nobody is worth zero at the table
+    total = sum(weights.values())
+    return {p: len(MINISTRIES) * w / total for p, w in weights.items()}
+
+
+def propose_cabinet(game: Game, pid: str) -> dict:
+    """Split ministries by seats (D'Hondt), each party picking its favourite remaining ministry in turn."""
+    members = sorted(game.coalition_of(pid))
+    totals = game.seat_totals()
+    got = {p: 0 for p in members}
+    free = list(MINISTRIES)
+    alloc = {}
+    while free:
+        p = max(members, key=lambda m: ((totals.get(m, 0) + 1) / (got[m] + 1), m == pid))
+        pick = next(m for m in _preferences(game, p) if m in free)
+        alloc[pick] = p
+        free.remove(pick)
+        got[p] += 1
+    return alloc
+
+
+def respond_to_cabinet(game: Game, bot: str, alloc: dict, level: str, rng: random.Random) -> bool:
+    mine = sum(1 for p in alloc.values() if p == bot)
+    fair = fair_shares(game, sorted(game.coalition_of(bot)))[bot]
+    if level == "easy":
+        return rng.random() < 0.7
+    if level == "normal":
+        return mine >= max(1, int(fair * 0.7))
+    return mine >= max(1, round(fair))

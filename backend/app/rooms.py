@@ -12,6 +12,7 @@ from fastapi import WebSocket
 
 from . import bots
 from .engine import DEFAULT_TRAIT, TRAITS, ActionError, Game, Player, Rules
+from .politics import ISSUES, MINISTRIES, clean_platform, default_platform
 from .maps import load_map
 
 COLORS = ["#e63946", "#1d7fd6", "#f4a300", "#2a9d8f", "#8e44ad", "#e76f51", "#43aa8b", "#d63384"]
@@ -35,12 +36,14 @@ class Member:
     is_bot: bool = False
     bot_level: str = "normal"
     trait: str = DEFAULT_TRAIT
+    platform: dict = field(default_factory=dict)
     ws: WebSocket | None = None
 
     def public(self) -> dict:
         return {"id": self.id, "name": self.name, "party": self.party, "color": self.color, "left": self.left,
                 "ready": self.ready, "is_bot": self.is_bot, "online": self.is_bot or self.ws is not None,
-                "bot_level": self.bot_level if self.is_bot else None, "trait": self.trait}
+                "bot_level": self.bot_level if self.is_bot else None, "trait": self.trait,
+                "platform": self.platform or default_platform(self.left)}
 
 
 @dataclass
@@ -75,7 +78,7 @@ class Room:
                 "host": self.members[self.host_id].name if self.host_id in self.members else None}
 
     def room_state(self) -> dict:
-        return {**self.summary(), "traits": TRAITS, "bot_levels": bots.LEVELS, "host_id": self.host_id, "turn_seconds": self.turn_seconds, "rounds": self.rounds,
+        return {**self.summary(), "traits": TRAITS, "bot_levels": bots.LEVELS, "issues": ISSUES, "ministries": MINISTRIES, "host_id": self.host_id, "turn_seconds": self.turn_seconds, "rounds": self.rounds,
                 "members": [m.public() for m in self.members.values()], "chat": self.chat[-50:],
                 "deadline": self.deadline, "phase": self.phase, "acks": sorted(self.acks)}
 
@@ -99,7 +102,7 @@ class Room:
             raise RoomError("unknown bot level")
         trait = self.rng.choice(list(TRAITS)) if is_bot else DEFAULT_TRAIT
         m = Member(mid, secrets.token_urlsafe(16), name, party, color, left, ready=is_bot, is_bot=is_bot,
-                   bot_level=level, trait=trait)
+                   bot_level=level, trait=trait, platform=bots.choose_platform(left, self.rng) if is_bot else {})
         self.members[mid] = m
         if not self.host_id:
             self.host_id = mid
@@ -127,6 +130,11 @@ class Room:
             m.party = party
         if "left" in data:
             m.left = max(0, min(100, int(data["left"])))
+        if "platform" in data:
+            try:
+                m.platform = clean_platform(data["platform"])
+            except ValueError as e:
+                raise RoomError(str(e))
         if "trait" in data:
             if data["trait"] not in TRAITS:
                 raise RoomError("unknown trait")
@@ -150,7 +158,8 @@ class Room:
             raise RoomError("need at least 2 players (add a bot?)")
         if not all(m.ready for m in self.members.values()):
             raise RoomError("everyone must be ready")
-        players = {m.id: Player(m.id, m.name, m.party, m.color, m.left, is_bot=m.is_bot, trait=m.trait)
+        players = {m.id: Player(m.id, m.name, m.party, m.color, m.left, is_bot=m.is_bot, trait=m.trait,
+                                platform=dict(m.platform) or default_platform(m.left))
                    for m in self.members.values()}
         self.game = Game(load_map(self.map_id), players, Rules(rounds=self.rounds, max_rounds=self.rounds * 2))
         self._begin_planning()
@@ -158,6 +167,7 @@ class Room:
     def _begin_planning(self) -> None:
         self.phase = "planning"
         self.acks = set()
+        self._bots_negotiate()
         self._bots_submit()
         self.deadline = time.time() + self.turn_seconds
 
@@ -199,6 +209,47 @@ class Room:
             self.resolve()
 
     # ---------- diplomacy ----------
+    def _bot_members(self, pids) -> list[Member]:
+        return [self.members[p] for p in pids if p in self.members and self.members[p].is_bot]
+
+    def _bots_answer_cabinet(self, key: frozenset) -> None:
+        """Bots in the coalition answer a pending ministry proposal right away."""
+        g = self.game
+        prop = g.cabinet_proposals.get(key)
+        for b in self._bot_members(sorted(key)):
+            if not prop or b.id in prop["accepted"]:
+                continue
+            ok = bots.respond_to_cabinet(g, b.id, prop["alloc"], b.bot_level, self.rng)
+            g.answer_cabinet(b.id, ok)
+            if not ok:
+                self.chat.append({"from": b.id, "name": b.party, "color": b.color,
+                                  "text": "We deserve more ministries than that.", "at": time.time()})
+            prop = g.cabinet_proposals.get(key)
+
+    def _bots_negotiate(self) -> None:
+        """Coalitions with bots and no ministry deal: the strongest bot tables a seat-proportional split."""
+        g = self.game
+        for c in list(g.coalitions):
+            key = frozenset(c)
+            if key in g.cabinets or key in g.cabinet_proposals:
+                continue
+            members = self._bot_members(sorted(c))
+            if not members:
+                continue
+            totals = g.seat_totals()
+            lead = max(members, key=lambda m: totals.get(m.id, 0))
+            g.propose_cabinet(lead.id, bots.propose_cabinet(g, lead.id))
+            if key in g.cabinet_proposals:
+                self._bots_answer_cabinet(key)
+
+    def propose_cabinet(self, mid: str, alloc: dict) -> None:
+        if not self.game or self.game.finished:
+            raise RoomError("no game running")
+        self.game.propose_cabinet(mid, alloc)
+        key = frozenset(self.game.coalition_of(mid))
+        if key in self.game.cabinet_proposals:
+            self._bots_answer_cabinet(key)
+
     def propose_coalition(self, mid: str, target: str) -> None:
         if not self.game or self.game.finished:
             raise RoomError("no game running")
@@ -216,6 +267,8 @@ class Room:
         st = self.game.public_state()
         st["my_pending"] = self.game.pending.get(mid)
         st["deadline"] = self.deadline
+        if mid in self.game.players:  # everything that scales my campaigning, per region (platform, ministries, ...)
+            st["my_mult"] = {rid: round(self.game.campaign_mult(mid, rid), 3) for rid in self.game.regions}
         return st
 
     # ---------- networking ----------

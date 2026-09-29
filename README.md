@@ -18,7 +18,18 @@ cd backend && ../.venv/bin/python -m pytest -q   # tests
   🎤 Orator (rallies +25%), 📺 Media darling (ads +30%), 💼 Tycoon (+20% economy/sector income),
   💰 Fundraiser (base income +60%), 🧲 Populist (ideology fit never below ×0.8, half mismatch penalty),
   🌱 Grassroots (support fades 5% instead of 10%). Host can add **Easy / Normal / Hard** bots. 2–8 players.
-- **Event cards**: every round opens with a card everyone sees while planning — sector boom/slump, scandal
+- **Ideology**: besides left/right, each party picks a **policy platform** in the lobby (Economy, Environment,
+  Globalisation, Society; left / neutral / right stance). Stances add or remove campaign effectiveness in certain sectors
+  or with left/right-leaning voters; a stance against your own ideology is only half as convincing.
+  **Loyal base**: support fades at 0.5× where voters share your ideology, up to 1.5× where they don't.
+  **Repositioning**: shift 10 points left/right for 150K; voters distrust flip-flops (−15% campaigning for two rounds).
+  **Coalition tension**: partners more than 25 points apart all lose support every round (e.g. 60-point gap → −10.5%).
+- **Government & ministries**: after each election the largest bloc governs. Eight ministries give real bonuses
+  (Finance +100K/round, Economy & Industry, Agriculture, Trade & Tourism sector income +30%, Communications ads +25%,
+  Interior/Social Affairs +20% rallies with right/left-leaning voters, Foreign Affairs +10% campaigning). A single-party
+  government holds them all; a **coalition must negotiate** the split in Diplomacy (propose → every partner accepts;
+  counter-proposals allowed). Bots table seat-proportional deals and reject ones below their fair share.
+- **Event cards**: every round opens with a card everyone sees while planning — sector boom/slump, economic or security crisis (boosts left/right-leaning parties), scandal
   (−25% support for one party), TV debate (ads +50%), disaster (a region's economy pays nothing, rallies there +50%),
   voter apathy (independents +50%), left/right mood swings, donor season, sympathy for the underdog.
 - **Diplomacy**: propose/accept coalitions at any time; partners can't attack each other; anyone can leave.
