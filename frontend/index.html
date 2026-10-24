@@ -2,11 +2,21 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- viewport-fit=cover is what makes env(safe-area-inset-*) resolve to real values, so the
+       bottom tab bar clears the gesture bar and the topbar clears a notch. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0f18">
+  <meta name="mobile-web-app-capable" content="yes">
   <title>Election Night</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png" sizes="192x192">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <!-- No web fonts: a CDN request cannot be served inside the offline APK and blocks first paint
+       in the browser. The system stack below renders immediately everywhere. -->
   <link rel="stylesheet" href="/style.css">
+  <!-- Server address for packaged builds; empty = same origin, i.e. the browser case. -->
+  <script src="/js/server-config.js"></script>
   <!-- three.js is vendored (frontend/vendor/three, MIT) so the 3D board works offline -->
   <script type="importmap">
     { "imports": { "three": "/vendor/three/three.module.min.js",

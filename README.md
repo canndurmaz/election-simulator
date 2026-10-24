@@ -12,6 +12,23 @@ cd backend && ../.venv/bin/uvicorn app.server:app --host 0.0.0.0 --port 8000
 cd backend && ../.venv/bin/python -m pytest -q   # tests
 ```
 
+## Desktop app (pywebview)
+
+The same game in a native window: the server runs inside the app, nothing to deploy.
+
+```bash
+# Linux: sudo apt install python3-gi gir1.2-webkit2-4.1   (or use pip install "pywebview[qt]")
+python3 -m venv --system-site-packages .venv && .venv/bin/pip install -r backend/requirements-desktop.txt
+cd backend && ../.venv/bin/python desktop.py            # play locally / vs bots
+cd backend && ../.venv/bin/python desktop.py --lan      # host: friends open http://<your-ip>:8000 in a browser
+cd backend && ../.venv/bin/python desktop.py --connect https://election.example.com   # join a remote server
+```
+
+Rooms and rejoin sessions survive restarts (stored in `~/.local/share/election-night`, `%APPDATA%\Election Night`
+or `~/Library/Application Support/Election Night`). `--lan` makes invite links use your LAN address.
+Standalone build: `pip install pyinstaller && pyinstaller election-night.spec` → `dist/ElectionNight/`
+(build on each OS you want to ship; PyInstaller does not cross-compile).
+
 ## Rules (defaults in `backend/app/engine.py` → `Rules`)
 
 - **Setup**: each player picks a party name, color, ideology (e.g. 50% left / 50% right) and a **leader strength**:

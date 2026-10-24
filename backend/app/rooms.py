@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 from fastapi import WebSocket
 
-from . import bots
+from . import bots, store
 from .engine import DEFAULT_TRAIT, TRAITS, ActionError, Game, Player, Rules
 from .politics import ISSUES, MINISTRIES, clean_platform, default_platform
 from .maps import load_map
@@ -261,14 +261,20 @@ class Room:
                 self.chat.append({"from": t.id, "name": t.party, "color": t.color,
                                   "text": "No thanks, we'll go it alone.", "at": time.time()})
 
-    def game_state_for(self, mid: str) -> dict | None:
+    def game_state_for(self, mid: str, base: dict | None = None) -> dict | None:
+        """Per-player view. `base` is a `public_state()` shared by everyone in this broadcast:
+        building it once instead of once per member is the difference between one and eight full
+        state builds per message. The copy is shallow on purpose -- only the three keys below are
+        per-player, and the shared values are serialised immediately and never mutated here."""
         if not self.game:
             return None
-        st = self.game.public_state()
+        st = dict(base if base is not None else self.game.public_state())
         st["my_pending"] = self.game.pending.get(mid)
         st["deadline"] = self.deadline
         if mid in self.game.players:  # everything that scales my campaigning, per region (platform, ministries, ...)
-            st["my_mult"] = {rid: round(self.game.campaign_mult(mid, rid), 3) for rid in self.game.regions}
+            held = st.get("ministries") or {}
+            st["my_mult"] = {rid: round(self.game.campaign_mult(mid, rid, ministries=held), 3)
+                             for rid in self.game.regions}
         return st
 
     # ---------- networking ----------
@@ -281,15 +287,34 @@ class Room:
             m.ws = None
 
     async def broadcast(self) -> None:
+        targets = [m for m in self.members.values() if m.ws is not None]
+        if not targets:
+            return
         room = self.room_state()
-        for m in list(self.members.values()):
-            if m.ws is not None:
-                await self.send(m, {"t": "state", "room": room, "game": self.game_state_for(m.id), "you": m.id})
+        base = self.game.public_state() if self.game else None
+        await asyncio.gather(*(
+            self.send(m, {"t": "state", "room": room, "game": self.game_state_for(m.id, base), "you": m.id})
+            for m in targets))
 
 
 class RoomManager:
-    def __init__(self):
+    """Owns the live rooms. `persistence` is optional: without it the manager behaves exactly as
+    before (rooms only in memory), which is what the unit tests use."""
+
+    def __init__(self, persistence: "store.Persistence | None" = None):
         self.rooms: dict[str, Room] = {}
+        self.persistence = persistence or store.Persistence(None)
+        self.persistence.bind(self.rooms)
+
+    def mark(self, room: Room, urgent: bool = False) -> None:
+        """Queue a snapshot of `room`. Cheap: it only adds a code to a set."""
+        self.persistence.mark(room, urgent)
+
+    def restore(self) -> int:
+        """Reload rooms from the last snapshot. Returns how many came back."""
+        for room in self.persistence.restore(Room, Member):
+            self.rooms[room.code] = room
+        return len(self.rooms)
 
     def _code(self) -> str:
         while True:
@@ -303,6 +328,7 @@ class RoomManager:
         room = Room(self._code(), (name or "").strip()[:40] or "Election Night", map_id,
                     max(2, min(8, max_players)), max(20, min(600, turn_seconds)), max(1, min(50, rounds)), private)
         self.rooms[room.code] = room
+        self.mark(room, urgent=True)
         return room
 
     def get(self, code: str) -> Room:
@@ -319,6 +345,7 @@ class RoomManager:
         room = self.rooms.pop(code, None)
         if not room:
             raise RoomError("room not found")
+        self.persistence.forget(code)
         for m in room.members.values():
             ws, m.ws = m.ws, None  # detach first so disconnect handlers don't touch the room
             if ws is not None:
@@ -346,6 +373,7 @@ class RoomManager:
             humans_online = any(m.ws is not None for m in r.members.values() if not m.is_bot)
             if not humans_online and now - r.last_activity > IDLE_ROOM_TTL or not r.members:
                 del self.rooms[code]
+                self.persistence.forget(code)
 
 
 __all__ = ["RoomManager", "Room", "RoomError", "ActionError"]

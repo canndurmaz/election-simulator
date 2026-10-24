@@ -10,22 +10,31 @@ WS:    /ws/{code}?token=...   client -> {"t": "profile"|"ready"|"start"|"add_bot
 """
 import asyncio
 import contextlib
+import json
 import os
 import secrets
 import time
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import store
 from .engine import ActionError
 from .maps import list_maps, load_map
 from .rooms import RoomError, RoomManager
 
-FRONTEND = Path(__file__).resolve().parent.parent.parent / "frontend"
-manager = RoomManager()
+FRONTEND = Path(os.environ.get("ELECTION_FRONTEND") or Path(__file__).resolve().parent.parent.parent / "frontend")
+# Where invite links should point when the server's own origin is not what friends can open
+# (the desktop app's window talks to 127.0.0.1, but players join via the LAN address).
+PUBLIC_URL = os.environ.get("ELECTION_PUBLIC_URL", "").strip().rstrip("/")
+VERSION = "1.1.0"
+persistence = store.build()
+manager = RoomManager(persistence)
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN") or secrets.token_urlsafe(12)
 if not os.environ.get("ADMIN_TOKEN"):
     print(f"\n  Admin page: /admin   token: {ADMIN_TOKEN}   (set ADMIN_TOKEN to choose your own)\n", flush=True)
@@ -43,18 +52,46 @@ async def ticker():
                 async with room.lock:
                     if room.phase == "planning" and room.deadline and now >= room.deadline and not room.game.finished:
                         room.resolve()
+                        manager.mark(room, urgent=True)   # a resolved round is worth not losing
                 await room.broadcast()
         manager.cleanup()
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app):
+    if persistence.enabled:
+        restored = manager.restore()
+        print(f"  Persistence: {store.db_path_from_env()}" + (f"  ({restored} room(s) restored)" if restored else ""),
+              flush=True)
+        persistence.start()
     task = asyncio.create_task(ticker())
     yield
     task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await persistence.stop()          # last flush, then close the database cleanly
 
 
 app = FastAPI(title="Election Game", lifespan=lifespan)
+
+# Map JSON is 60-136 KB and the vendored three.js is 672 KB: gzip cuts both by ~75%,
+# which is the single biggest win on a phone's connection. Small responses are left alone.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
+
+# The Android build serves its own assets from https://localhost inside the WebView, so every
+# /api call from the packaged app is cross-origin and needs CORS (WebSockets do not). Set
+# ALLOWED_ORIGINS (comma-separated) to add your own web origin.
+MOBILE_ORIGINS = ["capacitor://localhost", "https://localhost", "http://localhost", "ionic://localhost"]
+ALLOWED_ORIGINS = MOBILE_ORIGINS + [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https?://localhost(:\d+)?$",
+    allow_credentials=False,          # the session token travels in the body/query, never a cookie
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Admin-Token"],
+    max_age=86400,
+)
 
 
 class CreateRoom(BaseModel):
@@ -84,6 +121,12 @@ def map_detail(map_id: str):
         raise HTTPException(404, "unknown map")
 
 
+@app.get("/api/health")
+def health():
+    """Cheap liveness probe. The Android app pings this to check a server address."""
+    return {"ok": True, "version": VERSION, "rooms": len(manager.rooms), "persistent": persistence.enabled}
+
+
 @app.get("/api/rooms")
 def rooms():
     return manager.public_list()
@@ -96,6 +139,7 @@ def create_room(req: CreateRoom):
     except KeyError:
         raise HTTPException(404, "unknown map")
     m = room.add_member(req.player_name)
+    manager.mark(room, urgent=True)
     return {"code": room.code, "player_id": m.id, "token": m.token}
 
 
@@ -107,6 +151,7 @@ def join_room(code: str, req: JoinRoom):
     except RoomError as e:
         raise HTTPException(400, str(e))
     room.last_activity = time.time()
+    manager.mark(room, urgent=True)
     return {"code": room.code, "player_id": m.id, "token": m.token}
 
 
@@ -218,6 +263,11 @@ async def ws_endpoint(ws: WebSocket, code: str, token: str = ""):
             await me.ws.close()
     me.ws = ws
     room.last_activity = time.time()
+    # A room restored from disk has no deadline (nobody was connected): restart the clock now that
+    # someone is back, so a server restart mid-round does not freeze the game.
+    if room.game and room.phase == "planning" and not room.game.finished and room.deadline is None:
+        room.deadline = time.time() + room.turn_seconds
+    manager.mark(room)
     await room.broadcast()
     try:
         while True:
@@ -229,6 +279,8 @@ async def ws_endpoint(ws: WebSocket, code: str, token: str = ""):
                 except (RoomError, ActionError, ValueError, TypeError) as e:
                     await ws.send_json({"t": "error", "msg": str(e)})
                     continue
+                # Write-behind: this only flags the room, the flusher batches the actual write.
+                manager.mark(room, urgent=msg.get("t") in ("start", "submit", "next") if isinstance(msg, dict) else False)
             await room.broadcast()
             if not alive:
                 await ws.close()
@@ -245,17 +297,41 @@ async def ws_endpoint(ws: WebSocket, code: str, token: str = ""):
                     if room.ready_to_resolve():
                         room.resolve()
                     room.maybe_next_turn()
+                manager.mark(room)
             await room.broadcast()
+
+
+NO_CACHE = {"Cache-Control": "no-cache"}
+
+
+class CachedStatic(StaticFiles):
+    """Vendored libraries never change, so they get a year; game code must revalidate every load
+    (`no-cache` still answers 304 from the ETag, it just refuses to serve stale JS after a deploy)."""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        path = str(getattr(resp, "path", ""))
+        resp.headers["Cache-Control"] = ("public, max-age=31536000, immutable"
+                                         if "/vendor/" in path else "no-cache")
+        return resp
 
 
 @app.get("/")
 def index():
-    return FileResponse(FRONTEND / "index.html")
+    return FileResponse(FRONTEND / "index.html", headers=NO_CACHE)
+
+
+if PUBLIC_URL:
+    @app.get("/js/server-config.js")
+    def server_config():
+        """Shadows the static file: same-origin API, but invite links use PUBLIC_URL."""
+        body = f'window.__ELECTION_SERVER__ = "";\nwindow.__ELECTION_WEB__ = {json.dumps(PUBLIC_URL)};\n'
+        return Response(body, media_type="text/javascript", headers=NO_CACHE)
 
 
 @app.get("/admin")
 def admin_page():
-    return FileResponse(FRONTEND / "admin.html")
+    return FileResponse(FRONTEND / "admin.html", headers=NO_CACHE)
 
 
-app.mount("/", StaticFiles(directory=FRONTEND), name="static")
+app.mount("/", CachedStatic(directory=FRONTEND), name="static")
