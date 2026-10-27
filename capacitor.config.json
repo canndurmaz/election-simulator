@@ -1,0 +1,25 @@
+{
+  "appId": "com.electionnight.game",
+  "appName": "Election Night",
+  "webDir": "frontend",
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#0f1420"
+  },
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchAutoHide": false,
+      "backgroundColor": "#0f1420",
+      "androidScaleType": "CENTER_CROP",
+      "showSpinner": false
+    },
+    "StatusBar": {
+      "style": "DARK",
+      "backgroundColor": "#0b0f18",
+      "overlaysWebView": false
+    }
+  }
+}

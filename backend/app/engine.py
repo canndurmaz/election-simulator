@@ -247,22 +247,28 @@ class Game:
         base = self.regions[rid]["seats"] * self.rules.independent_support_per_seat
         return base * (1.5 if self._ev("apathy") else 1.0)
 
-    def campaign_mult(self, pid: str, rid: str, kind: str = "rally") -> float:
+    def campaign_mult(self, pid: str, rid: str, kind: str = "rally", ministries: dict | None = None) -> float:
         """Everything that scales a party's campaigning in a region (traits like Orator/Media are applied
-        per action type in resolve)."""
+        per action type in resolve).
+
+        `ministries` is an optional precomputed {ministry: holder} map, as returned by `ministry_map()`.
+        Callers that ask for many regions at once should pass it: otherwise each `holds()` rebuilds
+        `frozenset(self.government)`, which dominates the cost of a per-region sweep.
+        """
         p, r = self.players[pid], self.regions[rid]
+        held = ministries if ministries is not None else self.ministry_map()
         m = self.effective_multiplier(pid, rid) * platform_mult(p.platform, p.left, r["sector"], r["right"])
         if p.credibility_until >= self.round:
             m *= self.rules.credibility_penalty
         if (self._ev("econ_crisis") and p.left >= 55) or (self._ev("security_crisis") and p.left <= 45):
             m *= 1.25
-        if self.holds(pid, "foreign"):
+        if held.get("foreign") == pid:
             m *= 1.1
         if kind == "rally":
             lean = leaning(r["right"])
-            if self.holds(pid, "agriculture") and r["sector"] == "agriculture":
+            if held.get("agriculture") == pid and r["sector"] == "agriculture":
                 m *= 1.15
-            if (self.holds(pid, "interior") and lean == "right") or (self.holds(pid, "social") and lean == "left"):
+            if (held.get("interior") == pid and lean == "right") or (held.get("social") == pid and lean == "left"):
                 m *= 1.2
         return m
 
@@ -276,6 +282,16 @@ class Game:
 
     def holds(self, pid: str, ministry: str) -> bool:
         return self.ministry_holder(ministry) == pid
+
+    def ministry_map(self) -> dict[str, str | None]:
+        """{ministry: holder} in one pass. Cheap to build, so it is never cached (and so can never
+        go stale); pass it to `campaign_mult` when sweeping many regions."""
+        if not self.government:
+            return {}
+        if len(self.government) == 1:
+            return dict.fromkeys(MINISTRIES, self.government[0])
+        alloc = self.cabinets.get(frozenset(self.government), {})
+        return {m: alloc.get(m) for m in MINISTRIES}
 
     def _form_government(self, totals: dict) -> None:
         blocs = [sorted(c) for c in self.coalitions] + [[p] for p in self.players if not self.partners(p)]
@@ -659,6 +675,7 @@ class Game:
     def public_state(self) -> dict:
         def rnd(d):
             return {k: round(v) for k, v in d.items() if v > 0}
+        held = self.ministry_map()
         return {
             "round": self.round, "rounds": self.rules.rounds, "max_rounds": self.rules.max_rounds,
             "finished": self.finished, "overtime": self.round > self.rules.rounds, "unclaimed": self.unclaimed(),
@@ -686,7 +703,7 @@ class Game:
             "platforms": {pid: p.platform for pid, p in self.players.items()},
             "credibility": {pid: p.credibility_until for pid, p in self.players.items()},
             "government": self.government,
-            "ministries": {m: self.ministry_holder(m) for m in MINISTRIES},
+            "ministries": {m: held.get(m) for m in MINISTRIES},
             "cabinets": [{"members": sorted(k), "alloc": v} for k, v in self.cabinets.items()],
             "cabinet_proposals": [{"members": sorted(k), "by": v["by"], "alloc": v["alloc"], "accepted": sorted(v["accepted"])}
                                   for k, v in self.cabinet_proposals.items()],

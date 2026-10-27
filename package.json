@@ -1,0 +1,30 @@
+{
+  "name": "election-night",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Android packaging for Election Night. The game itself is plain JS in frontend/ and needs no build step -- Capacitor copies that folder into the APK as-is.",
+  "scripts": {
+    "icons": "python3 tools/make_icons.py",
+    "set-server": "node tools/set-server.mjs",
+    "android:init": "npm run icons && npx cap add android && npm run android:patch && npm run android:assets && npx cap sync android",
+    "android:assets": "npx capacitor-assets generate --android --iconBackgroundColor \"#0f1420\" --splashBackgroundColor \"#0f1420\" --splashBackgroundColorDark \"#0b0f18\"",
+    "android:sync": "npx cap sync android && npm run android:patch",
+    "android:run": "npx cap run android",
+    "android:open": "npx cap open android",
+    "android:apk": "npm run android:sync && cd android && ./gradlew assembleDebug && echo \"\\nAPK: android/app/build/outputs/apk/debug/app-debug.apk\"",
+    "android:release": "npm run android:sync && cd android && ./gradlew assembleRelease && echo \"\\nAPK: android/app/build/outputs/apk/release/app-release.apk\"",
+    "android:bundle": "npm run android:sync && cd android && ./gradlew bundleRelease && echo \"\\nAAB: android/app/build/outputs/bundle/release/app-release.aab\"",
+    "android:patch": "node tools/android-patch.mjs"
+  },
+  "dependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/app": "^7.0.0",
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/splash-screen": "^7.0.0",
+    "@capacitor/status-bar": "^7.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@capacitor/cli": "^7.0.0"
+  }
+}

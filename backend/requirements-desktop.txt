@@ -1,0 +1,5 @@
+-r requirements.txt
+pywebview>=5.0
+# Linux GUI backend: either the distro's GTK bindings (apt install python3-gi gir1.2-webkit2-4.1,
+# then create the venv with --system-site-packages) or Qt: pip install "pywebview[qt]".
+# Windows uses Edge WebView2 and macOS uses WebKit; nothing extra is needed there.

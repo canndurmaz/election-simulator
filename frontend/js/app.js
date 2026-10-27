@@ -1,4 +1,5 @@
 import { MapView } from './map.js';
+import { NATIVE, needsSetup, probe, serverUrl, setServerUrl, shareBase, url, wsUrl } from './config.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const app = $('#app');
@@ -39,8 +40,19 @@ function toast(msg, info = false) {
   d.textContent = msg; if (info) d.className = 'info';
   $('#toast').appendChild(d); setTimeout(() => d.remove(), 3500);
 }
+/** Clipboard API where available; the textarea fallback covers WebViews (pywebview) and plain-http LAN hosts. */
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return; } catch {}
+  const t = Object.assign(document.createElement('textarea'), { value: text });
+  t.style.cssText = 'position:fixed;opacity:0';
+  document.body.appendChild(t); t.select();
+  const ok = document.execCommand('copy'); t.remove();
+  if (!ok) throw new Error('copy failed');
+}
 async function api(path, body) {
-  const res = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  // url() is the server origin in the packaged app and a no-op ('' + path) in the browser.
+  const res = await fetch(url(path), body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {})
+    .catch(() => { throw new Error(NATIVE ? 'Cannot reach the server. Check Settings → Server.' : 'Cannot reach the server.'); });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.detail || res.statusText);
   return data;
@@ -146,8 +158,7 @@ function forgetSession() {
 
 function connect() {
   const { code, token } = S.session;
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/${code}?token=${encodeURIComponent(token)}`);
+  const ws = new WebSocket(wsUrl(code, token));
   S.ws = ws;
   ws.onmessage = async ev => {
     const msg = JSON.parse(ev.data);
@@ -171,8 +182,9 @@ function render() {
 
 // ---------- home ----------
 async function renderHome() {
-  $('#topbar-extra').innerHTML = `<button class="small" id="howto">❓ How to play</button>`;
+  $('#topbar-extra').innerHTML = `${NATIVE ? '<button class="small" id="server">🛰️ Server</button>' : ''}<button class="small" id="howto">❓ How to play</button>`;
   $('#howto').onclick = () => showTutorial(0);
+  if (NATIVE) $('#server').onclick = () => renderServerSetup();
   S.mapView = null;
   const maps = await api('/api/maps').catch(() => []);
   const params = new URLSearchParams(location.search);
@@ -292,7 +304,7 @@ function renderLobby() {
       <div class="card chat" style="margin-top:14px">${chatHtml()}</div>
     </div>
   </div>`;
-  $('#copy').onclick = () => navigator.clipboard?.writeText(location.origin + '/?room=' + r.code).then(() => toast('Link copied', true));
+  $('#copy').onclick = () => copyText(shareBase() + '/?room=' + r.code).then(() => toast('Link copied', true), () => toast('Could not copy the link'));
   $('#saveparty').onclick = () => send({ t: 'profile', party: $('#party').value });
   $('#party').onkeydown = e => e.key === 'Enter' && send({ t: 'profile', party: $('#party').value });
   document.querySelectorAll('[data-color]').forEach(b => b.onclick = () => send({ t: 'profile', color: b.dataset.color }));
@@ -892,8 +904,83 @@ function showTutorial(i) {
   $('#tutnext').onclick = () => showTutorial(i + 1);
 }
 
+// ---------- server setup (packaged app only) ----------
+// The web build never sees this screen: needsSetup() is false whenever the page has an origin
+// that serves the API. The APK has no server of its own, so it has to ask once.
+async function renderServerSetup(note) {
+  $('#topbar-extra').innerHTML = '';
+  const current = serverUrl();
+  app.innerHTML = `
+  <div class="home single">
+    <div class="card">
+      <h2>🛰️ Connect to a server</h2>
+      <p class="muted">Election Night is multiplayer, so the app needs the address of a game server.
+        Ask whoever hosts your games for it, or run your own (see <b>DEPLOY.md</b>).</p>
+      <label>Server address</label>
+      <input id="surl" placeholder="https://election.example.com" value="${esc(current)}"
+             autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="url">
+      <div id="serr" class="bad" style="min-height:18px;font-size:12px;margin-top:6px">${esc(note || '')}</div>
+      <button class="primary" id="sgo" style="width:100%">Connect</button>
+      ${current ? '<button id="sback" style="width:100%;margin-top:8px">Cancel</button>' : ''}
+      <p class="muted" style="font-size:12px;margin-top:14px">Android blocks unencrypted traffic, so use an
+        <b>https://</b> address. A plain <b>http://</b> one only works on a local network build.</p>
+    </div>
+  </div>`;
+  const err = m => { $('#serr').textContent = m; };
+  $('#sback')?.addEventListener('click', renderHome);
+  $('#sgo').onclick = async () => {
+    const btn = $('#sgo'), value = $('#surl').value;
+    btn.disabled = true; btn.textContent = 'Checking…'; err('');
+    try {
+      const health = await probe(value);
+      setServerUrl(value);
+      toast(`Connected to server v${health.version}`, true);
+      renderHome();
+    } catch (e) {
+      err(e.message);
+      btn.disabled = false; btn.textContent = 'Connect';
+    }
+  };
+}
+
+// ---------- Android shell ----------
+// Capacitor exposes plugins on window.Capacitor.Plugins, so this works without a bundler and
+// keeps the project's no-build-step property. Every lookup is guarded: in a browser there is
+// no Capacitor object at all and this function does nothing.
+function wireNative() {
+  const P = globalThis.Capacitor?.Plugins;
+  if (!P) return;
+  document.documentElement.classList.add('native');   // enables the app-chrome rules in style.css
+  P.StatusBar?.setStyle({ style: 'DARK' }).catch(() => {});
+  P.StatusBar?.setBackgroundColor({ color: '#0b0f18' }).catch(() => {});
+  P.SplashScreen?.hide().catch(() => {});
+
+  // Android's back button: unwind the UI one step at a time instead of killing the app.
+  let armed = 0;
+  P.App?.addListener('backButton', () => {
+    const open = [...document.querySelectorAll('.overlay')].pop();
+    if (open) { open.remove(); return; }
+    if (S.room && isMobile() && S.tab !== 'map') { S.tab = 'map'; render(); return; }
+    if (S.session) {
+      if (Date.now() - armed < 2500) { send({ t: 'leave' }); forgetSession(); return; }
+      armed = Date.now();
+      toast('Press back again to leave the room', true);
+      return;
+    }
+    P.App.minimizeApp?.();
+  });
+
+  // Coming back from the background after the socket died: reconnect instead of showing a frozen board.
+  P.App?.addListener('appStateChange', ({ isActive }) => {
+    if (isActive && S.session && !S.ws) connect();
+  });
+}
+
 // ---------- boot ----------
 if (isMobile()) S.tab = 'map';
+wireNative();
 const code = new URLSearchParams(location.search).get('room')?.toUpperCase();
 const saved = code && JSON.parse(localStorage.getItem('session:' + code) || 'null');
-if (saved) { S.session = saved; connect(); } else renderHome();
+if (needsSetup()) renderServerSetup();
+else if (saved) { S.session = saved; connect(); }
+else renderHome();
